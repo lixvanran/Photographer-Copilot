@@ -1,0 +1,50 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Photographer Copilot",
+  "version": "0.1.0",
+  "identifier": "com.MiniMax.photographer-copilot",
+  "build": {
+    "beforeDevCommand": "cd ../web && pnpm dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "cd ../web && pnpm build",
+    "frontendDist": "../web/dist"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "摄影师助手",
+        "width": 1200,
+        "height": 800,
+        "minWidth": 900,
+        "minHeight": 600,
+        "theme": "Dark",
+        "resizable": true,
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' data: asset: http://asset.localhost; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:* http://localhost:* ws: wss:"
+    },
+    "trayIcon": {
+      "iconPath": "icons/icon.png",
+      "iconAsTemplate": true,
+      "tooltip": "摄影师助手"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "category": "Photography",
+    "shortDescription": "AI Copilot for Photographers",
+    "longDescription": "Local-first AI agent that helps photographers with culling, color grading, and photo knowledge."
+  },
+  "plugins": {}
+}

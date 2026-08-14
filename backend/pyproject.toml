@@ -1,0 +1,25 @@
+[project]
+name = "photographer-copilot-sidecar"
+version = "0.2.0"
+description = "Python sidecar for Photographer Copilot (M3 client, image processing, tools)"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "pydantic>=2.10",
+    "openai>=1.55",
+    "httpx>=0.28",
+    "Pillow>=11.0",
+    "rawpy>=0.23.1",
+    "numpy>=2.1",
+    "piexif>=1.1",
+    "aiosqlite>=0.20",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["agent*", "image*", "db*"]

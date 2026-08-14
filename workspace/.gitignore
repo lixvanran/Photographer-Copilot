@@ -1,0 +1,5 @@
+# 这个目录是用户数据的运行时目录
+# (input / output / .tasks / .logs / .sidecar-port / catalog.sqlite)
+# .gitkeep 标记目录存在,实际数据不入 git
+
+# 但需要让 git 跟踪子目录的"占位"

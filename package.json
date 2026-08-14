@@ -1,0 +1,9 @@
+{
+  "name": "photographer-copilot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "tauri:dev": "echo Run this in web/: pnpm tauri:dev"
+  }
+}

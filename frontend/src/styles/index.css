@@ -1,0 +1,173 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+    margin: 0;
+  }
+  body {
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    letter-spacing: -0.01em;
+  }
+
+  /* 浅色 scrollbar */
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: rgba(0, 0, 0, 0.15);
+    border-radius: 4px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: rgba(0, 0, 0, 0.3);
+  }
+}
+
+@layer components {
+  /* === Apple 风基础 === */
+  :root {
+    --apple-bg-1: #f5f5f7;
+    --apple-bg-2: #fbfbfd;
+    --apple-bg-sky: #e8f0fe;
+    --apple-bg-warm: #fff1e8;
+    --apple-bg-pink: #fee8f0;
+    --apple-text: #1a1f2e;
+    --apple-text-2: #6e6e73;
+    --apple-border: rgba(0, 0, 0, 0.08);
+    --apple-glass: rgba(255, 255, 255, 0.72);
+    --apple-glass-strong: rgba(255, 255, 255, 0.85);
+    --apple-shadow: 0 4px 16px rgba(0, 0, 0, 0.04), 0 1px 2px rgba(0, 0, 0, 0.06);
+    --apple-shadow-lg: 0 16px 48px rgba(0, 0, 0, 0.08), 0 2px 8px rgba(0, 0, 0, 0.04);
+  }
+
+  /* 苹果风主背景(浅色,带渐变光晕) */
+  .apple-bg {
+    background:
+      radial-gradient(ellipse at 0% 0%, var(--apple-bg-sky) 0%, transparent 50%),
+      radial-gradient(ellipse at 100% 0%, var(--apple-bg-warm) 0%, transparent 50%),
+      radial-gradient(ellipse at 50% 100%, var(--apple-bg-pink) 0%, transparent 50%),
+      var(--apple-bg-1);
+    min-height: 100vh;
+    position: relative;
+    overflow: hidden;
+    color: var(--apple-text);
+  }
+
+  /* 毛玻璃卡片 */
+  .apple-glass {
+    background: var(--apple-glass);
+    backdrop-filter: saturate(180%) blur(20px);
+    -webkit-backdrop-filter: saturate(180%) blur(20px);
+    border: 1px solid var(--apple-border);
+    box-shadow: var(--apple-shadow);
+    border-radius: 16px;
+  }
+
+  .apple-glass-strong {
+    background: var(--apple-glass-strong);
+    backdrop-filter: saturate(200%) blur(30px);
+    -webkit-backdrop-filter: saturate(200%) blur(30px);
+    border: 1px solid var(--apple-border);
+    box-shadow: var(--apple-shadow);
+    border-radius: 18px;
+  }
+
+  /* 苹果风按钮(胶囊) */
+  .apple-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 8px 18px;
+    border-radius: 980px;
+    font-weight: 500;
+    font-size: 14px;
+    letter-spacing: -0.01em;
+    transition: all 0.18s ease;
+    border: 1px solid transparent;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .apple-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .apple-btn-primary {
+    background: var(--apple-text);
+    color: white;
+  }
+  .apple-btn-primary:hover:not(:disabled) {
+    background: #2a2f45;
+    transform: translateY(-1px);
+  }
+
+  .apple-btn-secondary {
+    background: rgba(0, 0, 0, 0.05);
+    color: var(--apple-text);
+  }
+  .apple-btn-secondary:hover:not(:disabled) {
+    background: rgba(0, 0, 0, 0.1);
+  }
+
+  .apple-btn-accent {
+    background: var(--phc-accent, #ff7a45);
+    color: white;
+  }
+  .apple-btn-accent:hover:not(:disabled) {
+    background: #e56834;
+  }
+
+  /* 状态点 */
+  .status-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+  }
+  .status-dot-ok {
+    background: var(--phc-green, #34c77b);
+    box-shadow: 0 0 0 3px rgba(52, 199, 123, 0.18);
+    animation: pulse 2.4s ease-in-out infinite;
+  }
+  .status-dot-err {
+    background: var(--phc-red, #e5484d);
+  }
+  .status-dot-warn {
+    background: #f1a52a;
+  }
+  .status-dot-pending {
+    background: #b8b8bd;
+  }
+
+  /* Sidebar 导航项 */
+  .nav-item {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 14px;
+    border-radius: 12px;
+    transition: all 0.15s ease;
+    font-size: 13px;
+    font-weight: 500;
+    color: #4a4a52;
+  }
+  .nav-item:hover:not(.nav-item-active) {
+    background: rgba(0, 0, 0, 0.04);
+  }
+  .nav-item-active {
+    background: var(--apple-text);
+    color: white;
+    box-shadow: 0 2px 8px rgba(26, 31, 46, 0.18);
+  }
+}

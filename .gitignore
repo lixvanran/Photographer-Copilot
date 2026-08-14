@@ -1,0 +1,51 @@
+# Node
+node_modules/
+web/dist/
+.pnpm-store/
+
+# Python
+sidecar/.venv/
+sidecar/__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Rust
+src-tauri/target/
+src-tauri/Cargo.lock
+
+# Build outputs
+dist/
+build/
+*.exe
+*.dmg
+*.msi
+*.deb
+*.AppImage
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Env / secrets
+.env
+.env.local
+.env.*.local
+
+# Workspace runtime (keep directory + .gitkeep, ignore everything inside)
+/workspace/*
+!/workspace/.gitkeep
+!/workspace/.gitignore
+!/workspace/README.md
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Test workspace
+.test_401/
