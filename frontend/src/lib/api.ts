@@ -88,7 +88,10 @@ export const getConfig = () => call<ConfigInfo>("GET", "/config");
 export const listInputFolders = () => call<{ folders: FolderInfo[]; loose_files: LooseFileInfo[] }>("GET", "/input/folders");
 export const renameToIn = (folderName: string) => call<{ new_name: string }>("POST", "/input/rename", { folder_name: folderName });
 export const startGradeTask = (folderName: string, sceneHint?: string | null) =>
-  call<TaskInfo>("POST", "/tasks/grade", { folder_name: folderName, scene_hint: sceneHint ?? null });
+  call<TaskInfo>("POST", "/tasks/grade", {
+    folder_name: folderName,
+    scene_hint: sceneHint ?? null,
+  });
 export const startCullTask = (folderName: string, sceneHint?: string | null) =>
   call<TaskInfo>("POST", "/tasks/cull", { folder_name: folderName, scene_hint: sceneHint ?? null });
 export const getTask = (taskId: string) =>

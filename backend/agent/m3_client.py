@@ -457,31 +457,104 @@ class M3Client:
         # (那个 fallback 返回的 dict 没有 `keep` 字段,会害得所有照片
         # 都被默认 keep,筛片变成"全留")。
         if "color_grade" in user_text.lower() or "调色" in user_text or "修图" in user_text:
+            # v0.2.1 mock:不再预设"风格"标签,而是**真读图**给针对性诊断。
+            # 简单分析:主色 + 平均亮度 → 推断场景/光状态 → 写 diagnosis。
+            # 这模拟的是真 M3 拿到图像后会做的事(mock 只是占位)。
+            scene_label = "[MOCK] 主体居中"
+            diagnosis_label = "[MOCK] 整体曝光基本正常"
+            exif_lines = []
+            stats_lines = []
+            if images:
+                try:
+                    from PIL import Image
+                    with Image.open(images[0]) as im:
+                        im_rgb = im.convert("RGB").resize((64, 64))
+                        stat_rgb = list(im_rgb.getdata())
+                        r_sum = g_sum = b_sum = 0
+                        n = 0
+                        for px in stat_rgb:
+                            r_sum += px[0]; g_sum += px[1]; b_sum += px[2]
+                            n += 1
+                        mr, mg, mb = r_sum / n, g_sum / n, b_sum / n
+                        luma = 0.299 * mr + 0.587 * mg + 0.114 * mb
+                        # 直方图 8 段
+                        gray = im_rgb.convert("L")
+                        h = gray.histogram()
+                        total = sum(h)
+                        bins8 = [sum(h[i*32:(i+1)*32]) * 100.0 / total for i in range(8)]
+                        shadow_pct = bins8[0] + bins8[1]
+                        highlight_pct = bins8[6] + bins8[7]
+                        mid_pct = sum(bins8[2:6])
+                        # 估计色温
+                        if mb == 0: mb = 0.01
+                        rb_ratio = mr / mb
+                        if rb_ratio > 1.4: temp_k = 3500
+                        elif rb_ratio > 1.1: temp_k = 5000
+                        elif rb_ratio > 0.9: temp_k = 6000
+                        else: temp_k = 7500
+                        # 肤色占比
+                        skin = 0; sampled = 0
+                        for px in stat_rgb[::8]:
+                            r, g, b = px
+                            if r > 95 and 40 <= g <= 180 and 20 <= b <= 150 and r > g > b:
+                                skin += 1
+                            sampled += 1
+                        skin_pct = skin / max(1, sampled) * 100
+                        # ---- 客观拼诊断 ----
+                        parts = [f"亮度 {luma:.0f}/255(直方图 阴影{shadow_pct:.0f}% 中调{mid_pct:.0f}% 高光{highlight_pct:.0f}%)"]
+                        if skin_pct > 5:
+                            parts.append(f"肤色 {skin_pct:.0f}% 需保护")
+                        parts.append(f"色温 ~{temp_k}K")
+                        diagnosis_label = "[MOCK] " + ", ".join(parts)
+                        # 场景描述:基于主色 + 亮度
+                        if luma < 60:
+                            scene_label = "[MOCK] 整体偏暗(舞台/夜景/室内弱光)"
+                        elif luma > 180:
+                            scene_label = "[MOCK] 整体偏亮(强日光/逆光)"
+                        elif rb_ratio > 1.3:
+                            scene_label = "[MOCK] 偏暖光(室内钨丝灯/黄昏)"
+                        elif rb_ratio < 0.85:
+                            scene_label = "[MOCK] 偏冷光(阴天/阴影/夜景霓虹)"
+                        else:
+                            scene_label = "[MOCK] 自然光,色温基本正常"
+                        # 模拟 prompt 会拿到的 image_stats 字符串
+                        stats_lines = [
+                            f"- 平均亮度: {luma:.0f}/255",
+                            f"- 估计色温: ~{temp_k}K",
+                            f"- 直方图(8 段%): {[round(b, 1) for b in bins8]}",
+                            f"- 肤色像素占比: {skin_pct:.0f}%",
+                        ]
+                except Exception:
+                    pass
+            # 模拟 prompt 拿到的 exif 字符串(RAW 没 EXIF,mock 走"无")
+            exif_lines = ["(mock: RAW/JPG 无 EXIF,按图分析)"]
             params = {
-                "white_balance": {"temp_shift": random.randint(-200, 200), "tint_shift": random.randint(-20, 20)},
-                "exposure": round(random.uniform(-0.5, 0.5), 2),
-                "contrast": random.randint(-20, 30),
-                "highlights": random.randint(-40, 0),
-                "shadows": random.randint(0, 40),
-                "whites": random.randint(-10, 20),
-                "blacks": random.randint(-20, 10),
-                "vibrance": random.randint(-10, 25),
-                "saturation": random.randint(-15, 15),
+                "scene": scene_label,
+                "diagnosis": diagnosis_label,
+                "white_balance": {
+                    "temp_shift": random.randint(-15, 15),  # v0.2.1:不再 ±200,改成温和
+                    "tint_shift": random.randint(-10, 10),
+                },
+                "exposure": round(random.uniform(-0.3, 0.3), 2),
+                "contrast": random.randint(-15, 20),
+                "highlights": random.randint(-30, 0),
+                "shadows": random.randint(0, 30),
+                "whites": random.randint(-10, 15),
+                "blacks": random.randint(-15, 10),
+                "vibrance": random.randint(-5, 15),
+                "saturation": random.randint(-10, 10),
                 "hsl": {
                     "red": {"hue": 0, "sat": 0, "lum": 0},
-                    "orange": {"hue": 5, "sat": 10, "lum": 5},
+                    "orange": {"hue": 0, "sat": 0, "lum": 0},  # v0.2.1:别动肤色
                     "yellow": {"hue": 0, "sat": 0, "lum": 0},
-                    "green": {"hue": 0, "sat": -5, "lum": 0},
+                    "green": {"hue": 0, "sat": 0, "lum": 0},
                     "aqua": {"hue": 0, "sat": 0, "lum": 0},
-                    "blue": {"hue": 0, "sat": 5, "lum": 0},
+                    "blue": {"hue": 0, "sat": 0, "lum": 0},
                     "purple": {"hue": 0, "sat": 0, "lum": 0},
                     "magenta": {"hue": 0, "sat": 0, "lum": 0},
                 },
-                "curve": {
-                    "rgb": [[0, 0], [64, 70], [128, 140], [192, 210], [255, 255]]
-                },
                 "crop": None,
-                "notes": "[MOCK] 自动调色,统一暖色调 + 提阴影恢复细节",
+                "notes": f"[MOCK] {scene_label} {diagnosis_label} → 给出温和调整",
             }
             return json.dumps(params, ensure_ascii=False)
 
@@ -493,6 +566,7 @@ class M3Client:
             or "保留" in user_text  # 同上兜底
         ):
             decision = {
+                "scene": "[MOCK] 标准静物/风景,主体居中",
                 "keep": random.random() > 0.15,
                 "quality": random.randint(3, 5),
                 "reasons": [],

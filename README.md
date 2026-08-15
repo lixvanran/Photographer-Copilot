@@ -2,11 +2,71 @@
 
 一个跑在用户本地的「摄影工作区 Agent」,用 MiniMax M3 多模态帮摄影师做**一键调色 / 一键筛片 / 回答摄影问题**。数据不离开电脑。
 
-![Version](https://img.shields.io/badge/version-v0.2.0-blue.svg)
+![Version](https://img.shields.io/badge/version-v0.2.2-blue.svg)
 ![Status](https://img.shields.io/badge/status-stable-green.svg)
 ![License](https://img.shields.io/badge/license-MIT-purple.svg)
 
-## v0.2.0 升级要点
+## v0.2.2 升级要点
+
+这一版核心做了三件事:**修了一个真在影响效率的 bug** + **会话改成多对话模式** + **重点优化 AI 调色效果**。
+
+> 相比 v0.2.1:把上一版加的"风格 preset"按钮全砍了(套预设就是套市面滤镜),改成让 AI 真正读懂每张图自己决定调色方向。
+
+### 1. 修 cull bug — 一键筛片"文件传不了" / "传了没反应"
+
+之前 cull 完 frontend 拿到任务详情时,`photos[].output_path` 全是 `null`,只能看 keep/quality 状态,看不到产出文件在哪。根因是 `upsert_photo` 调 `output_path=...` 时 dest 还没赋值(`UnboundLocalError`)。v0.2.2 改完:
+
+- 复制 → catalog 顺序对调,`output_path` 真的写进 SQLite
+- `TaskProgress.tsx` 加 cull 照片列表 + ✅/❌/failed 状态 + 每张照片的 `output_path` 链接(可预览/打开)
+- "复制路径" 按钮(`navigator.clipboard.writeText(outputFolder)`),在 web 模式下方便拿到结果目录
+- 任务级 `output_folder` 字段(整组的输出目录)同步到前端
+
+### 2. 多会话模式 — 独立上下文的对话列表
+
+之前只有一个 messages 列表,新建任务要 `Ctrl+A → Del`。v0.2.2 改成左侧栏对话列表:
+
+- **每个对话的 messages 完全独立**(`Conversation` interface + `activeConvId` 切换),互不串
+- 新建 / 删除 / 切换 / 清空当前对话
+- localStorage 持久化(`phc.conversations.v1` + `phc.activeConv.v1`),刷新页面不丢
+- 自动迁移旧 key (`phc.messages.v1` → 第一个 conv 的 messages)
+- 每个 conv cap 200 条 messages,总数 cap 30 convs(超出自动 trim)
+- 后端 `/chat` 当前是单轮(M3 chat 端点无 multi-turn support),所以"独立上下文"指**前端 messages 隔离**,不会跨对话续聊——这点在 chat panel 文档里会写明
+
+### 3. 重点:AI 调色优化(这版最重要的改进)
+
+之前调色效果不理想的根因 — M3 **没拿到足够上下文**就开始下参数,所以经常瞎给:明明偏色了却给"自然还原",照片欠曝却不动 exposure,HSL 一拉就给橙色 +30 把肤色搞怪。v0.2.2 从三方面系统修:**核心是"AI 自己看图说话",不是套预设滤镜**。
+
+> **重要设计变更**:之前一版试过加 7 种"风格 preset"按钮(自然/明亮/电影/暖色/冷色/胶片/黑白),但这其实就是把市面滤镜换个名字让 AI 套——AI 该做的是**读懂这张图**,不是给一张"看起来差不多"的滤镜。v0.2.2 砍掉所有 preset 按钮,只留一个"用自然语言告诉 AI 你想做什么"的输入框,所有调色方向由 AI 基于客观分析自己决定。
+
+#### a) Prompt 改造:"每张图独立判断"哲学
+- 强制 M3 看到 EXIF + 客观分析后,**自己**判断这张图属于什么场景、有什么问题、保留什么
+- `scene` / `diagnosis` / `notes` 都要写真实观察(不是套话),notes 必须说"我看到 X,所以动了 Y"
+- 禁止套固定套路:不是所有夜景都该冷调,不是所有"看着闷"都该 +contrast,不是所有"逆光"都该提亮
+- 参数范围给"sweet spot 提示"(人像保守 / 风景大胆 / 演出/夜景针对当前光),但**是参考不是模板**
+
+#### b) EXIF + 客观图像分析(新模块 `image/analysis.py`)
+- 每张调色前同步读 EXIF(品牌/型号/ISO/光圈/快门/原 WB/拍摄时间),写进 prompt
+- 客观分析:平均亮度 / 直方图 8 段分布 / 平均饱和度 / 阴影/高光 clip 比例 / 估计色温(K) / **肤色像素占比**
+- M3 看到"肤色占比 18%"就知道保护肤色;看到"色温 ~7500K + 偏冷光"就知道这是阴天/夜景,可能保留戏剧性而不是压
+
+#### c) 用户反馈 → 风格倾向学习
+点 `👍` / `👎` 会被 catalog 记录(`photos.feedback`),下次调色前取最近 10 条,告诉 M3 "用户喜欢什么 / 不喜欢什么"。例:"👍 的最近 3 张:contrast=20, temp=+15, sat=10" → M3 后续输出会更靠近这个调子。
+
+#### d) color_grade.py 算法优化
+- HSL mask 改 **cosine falloff**(原来硬阈值,现在 ±0.11 hue 距离内 cos 曲线渐变),无 banding
+- HSL 强度按 saturation 衰减 — 灰区(低 s)不会被乱加色,避免 noise
+- 对比度改 **5 控制点 + 5-tap Gaussian 平滑 LUT**(原来线性 S-curve 有硬拐点)
+- highlights / shadows 用 smoothstep,过渡更柔
+- 黑白 luminance mask 改 Rec.709(0.2126 R + 0.7152 G + 0.0722 B),更接近人眼
+- **新加 split toning** — highlights / shadows 独立加色,XMP sidecar 写全 Lightroom 字段
+- 调参范围收窄(wb ±15 而不是 ±100,sat ±10 而不是 ±30),让 mock/弱模型也不会"一拉到底"
+
+#### e) XMP sidecar 升级
+之前只写基本 11 个字段,Lightroom 导入丢 split tone / 部分 HSL。v0.2.2 加上 `crs:SplitToningHighlightHue/Saturation` + `crs:SplitToningShadowHue/Saturation`,Lightroom 直接看到。
+
+---
+
+## v0.2.0 升级要点(上一版,作 v0.2.2 changelog 参照)
 
 这一版核心解决两个真在用的痛点 + 顺手清理了若干历史包袱。
 
@@ -70,7 +130,7 @@ python3 diagnose.py    # 诊断,生成 diagnose.txt
 └──────────────────────────────────────────────────────┘
 ```
 
-v0.3.0+ 计划接入 Tauri 2 (Rust) 桌面壳,代码在 `src-tauri/` 已就位(v0.2.0 暂不启用,需要 MSVC Build Tools)。
+v0.2.2+ 计划接入 Tauri 2 (Rust) 桌面壳,代码在 `src-tauri/` 已就位(v0.2.0 暂不启用,需要 MSVC Build Tools)。
 
 ## 已实现
 
@@ -119,7 +179,7 @@ photographer-copilot/
 │   │   └── styles/      (Apple 毛玻璃基础类)
 │   └── vite.config.ts + tailwind.config.js
 │
-├── src-tauri/                         # Tauri 桌面壳 (v0.3.0+ 启用,需要 MSVC Build Tools)
+├── src-tauri/                         # Tauri 桌面壳 (v0.2.2+ 启用,需要 MSVC Build Tools)
 │   ├── src/  (5 个 Rust 文件)
 │   ├── capabilities/ + icons/
 │   └── tauri.conf.json + Cargo.toml
@@ -127,7 +187,7 @@ photographer-copilot/
 ├── docs/ARCHITECTURE.md               # 架构文档
 ├── examples/sample_jpegs/             # 8 张场景示例图
 ├── scripts/smoke_test.py
-├── knowledge_base/                    # M3 提示词预设(v0.3.0+ 充实)
+├── knowledge_base/                    # M3 提示词预设(v0.2.2+ 充实)
 └── samples/                           # 演示数据
 ```
 

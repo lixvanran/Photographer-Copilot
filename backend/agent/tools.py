@@ -33,6 +33,12 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from ..db.catalog import Catalog
+from ..image.analysis import (
+    analyze_image,
+    format_exif,
+    format_image_stats,
+    parse_exif,
+)
 from ..image.color_grade import apply_color_grade
 from ..image.raw_processor import (
     is_raw,
@@ -47,7 +53,7 @@ from .m3_client import (
     M3QuotaError,
     M3ServerError,
 )
-from .prompts import build_cull_prompt, build_grade_prompt
+from .prompts import build_cull_prompt, build_grade_prompt, format_user_feedback
 
 logger = logging.getLogger(__name__)
 
@@ -419,7 +425,20 @@ async def cull_photos(
             tags = decision.get("tags", [])
             comment = decision.get("comment", "")
 
-            # Update catalog
+            # Copy keepers to output FIRST so we have a real dest path to
+            # record in the catalog. (修"cull 完找不到 output 文件"——upsert_photo
+            # 现在也收 output_path。)
+            dest: Path | None = None
+            if keep:
+                dest = output_folder / photo.name
+                if is_raw(photo):
+                    dest = output_folder / f"{photo.stem}.jpg"
+                await asyncio.to_thread(shutil.copy2, photo, dest)
+                kept += 1
+            else:
+                culled += 1
+
+            # Update catalog(写 output_path,前端就能给"打开文件"链接)
             photo_id = ctx.catalog.upsert_photo(
                 task_id=task_id,
                 source_path=str(photo),
@@ -429,18 +448,8 @@ async def cull_photos(
                 reasons=reasons,
                 tags=tags,
                 comment=comment,
+                output_path=str(dest) if dest else None,
             )
-
-            # Copy keepers to output (NEVER delete from input)
-            if keep:
-                dest = output_folder / photo.name
-                # For RAW, copy with .jpg extension hint
-                if is_raw(photo):
-                    dest = output_folder / f"{photo.stem}.jpg"
-                await asyncio.to_thread(shutil.copy2, photo, dest)
-                kept += 1
-            else:
-                culled += 1
 
             await _emit(ctx, "photo_done", {
                 "task_id": task_id,
@@ -506,7 +515,11 @@ async def cull_photos(
             f"筛片完成:共 {total} 张,保留 {kept} 张,剔除 {culled} 张,"
             f"失败 {failed} 张。输出目录:{output_folder.name}"
         )
-    ctx.catalog.update_task(task_id, status="done", summary=summary)
+    # 修 cull bug:把 output_folder 也写进 task catalog,前端 /tasks/{id} 返回
+    # 时就能看到 output_path,UI 可以"打开 output 目录"按钮。
+    ctx.catalog.update_task(
+        task_id, status="done", summary=summary, output_folder=str(output_folder)
+    )
     await _emit(ctx, "task_done", {"task_id": task_id, "summary": summary})
 
     return {
@@ -532,6 +545,12 @@ async def grade_photos(
     """
     Process all photos in a folder, asking M3 to produce color grade params.
     Outputs graded JPEG + XMP sidecar to output/<时间>-out/.
+
+    v0.2.1 升级:
+    - scene_hint 注入 prompt(用户用自然语言告诉 AI 这张图想怎么用)
+    - 每张照片先解析 EXIF + 客观图像分析,写进 prompt — M3 自己看图说话,
+      不再给"风格 preset"让它套
+    - 用户最近 👍/👎 调色记录作为风格倾向参考
     """
     if folder_name == "__loose__":
         input_folder = ctx.workspace / "input"
@@ -568,6 +587,31 @@ async def grade_photos(
     previews_dir = ctx.workspace / ".tasks" / task_id / "previews"
     previews_dir.mkdir(parents=True, exist_ok=True)
 
+    # v0.3.0:提前把"用户历史反馈"取出来,所有照片共用同一段(省一次 DB 查)。
+    # 只在 loop 外查一次,避免每张照片都重读 catalog。
+    user_feedback_str: str | None = None
+    try:
+        recent_feedback = ctx.catalog.recent_feedback(limit=10)
+        # recent_feedback 里的 grade_params 是 JSON 字符串,format_user_feedback
+        # 期望 dict。normalize 一下。
+        normalized: list[dict[str, Any]] = []
+        for f in recent_feedback:
+            gp = f.get("grade_params")
+            if isinstance(gp, str):
+                try:
+                    gp = json.loads(gp)
+                except Exception:
+                    gp = None
+            if not isinstance(gp, dict):
+                continue
+            normalized.append({
+                "grade_params": gp,
+                "feedback": f.get("feedback"),
+            })
+        user_feedback_str = format_user_feedback(normalized)
+    except Exception as e:
+        logger.debug("recent_feedback failed: %s", e)
+
     # Hoist fatal_err outside the loop so the final summary can detect
     # whether we exited via break (a fatal M3 error) or naturally.
     fatal_err: Exception | None = None
@@ -592,7 +636,24 @@ async def grade_photos(
                 "stage": "analyzing",
             })
 
-            prompt = build_grade_prompt(scene_hint)
+            # v0.3.0:每张照片的 prompt 注入 EXIF + 客观图像分析
+            # (同步跑 CPU 工作,几 ms 级别;但因为是同步阻塞,包到 to_thread 里)
+            exif_str: str | None = None
+            image_stats_str: str | None = None
+            try:
+                exif_dict = await asyncio.to_thread(parse_exif, photo)
+                exif_str = format_exif(exif_dict)
+                stats = await asyncio.to_thread(analyze_image, preview_path)
+                image_stats_str = format_image_stats(stats)
+            except Exception as e:
+                logger.debug("exif/analyze failed for %s: %s", photo, e)
+
+            prompt = build_grade_prompt(
+                scene_hint=scene_hint,
+                exif_summary=exif_str,
+                image_stats=image_stats_str,
+                user_feedback=user_feedback_str,
+            )
             # Same retry policy as cull: one retry on 5xx, immediate
             # abort on 401/402/429/network. See the cull_photos loop for
             # the rationale.
@@ -701,7 +762,10 @@ async def grade_photos(
             f"修图完成:共 {total} 张,成功 {graded} 张,失败 {failed} 张。"
             f"输出目录:{output_folder.name} (JPEG + XMP sidecar)"
         )
-    ctx.catalog.update_task(task_id, status="done", summary=summary)
+    # 同样把 output_folder 写进 task catalog(同 cull_photos 修复)。
+    ctx.catalog.update_task(
+        task_id, status="done", summary=summary, output_folder=str(output_folder)
+    )
     await _emit(ctx, "task_done", {"task_id": task_id, "summary": summary})
 
     return {
@@ -833,7 +897,10 @@ TOOL_SCHEMAS: list[dict] = [
                 "properties": {
                     "folder_name": {"type": "string"},
                     "task_id": {"type": "string"},
-                    "scene_hint": {"type": "string", "description": "可选,场景/风格提示"},
+                    "scene_hint": {
+                        "type": "string",
+                        "description": "可选,摄影师用自然语言写的意图(场景/保留/避开什么),例如 '逆光人像,保留背景冷蓝对比'",
+                    },
                 },
                 "required": ["folder_name", "task_id"],
             },

@@ -223,6 +223,7 @@ def _unwrap(result: Any) -> Any:
 class GradeRequest(BaseModel):
     folder_name: str
     scene_hint: str | None = None
+    # v0.2.2:删 style_preset — 套预设是套滤镜,让 AI 自己看图说话
 
 
 class CullRequest(BaseModel):
@@ -422,7 +423,10 @@ async def _run_grade_when_ready(ctx, task_id, req):
         except asyncio.TimeoutError:
             pass
     await grade_photos(
-        ctx, folder_name=req.folder_name, task_id=task_id, scene_hint=req.scene_hint
+        ctx,
+        folder_name=req.folder_name,
+        task_id=task_id,
+        scene_hint=req.scene_hint,
     )
 
 

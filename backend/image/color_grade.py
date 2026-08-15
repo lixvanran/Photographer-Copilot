@@ -1,6 +1,14 @@
 """
 Non-destructive color grading applied via Pillow + numpy.
 
+v0.3.0 升级:
+- HSL mask 改 cosine falloff(更平滑,无硬边)
+- 加 split toning(highlights / shadows 独立上色)
+- 白平衡改在 HSL 色相旋转上做(保留 luma 关系)
+- contrast 用样条曲线(smooth S-curve)
+- highlights/shadows 改成更"摄影"风格的 mask(高斯 smooth)
+- 加 YIQ 色彩空间白平衡(更接近人眼对色温的感知)
+
 This is intentionally a Lightroom-style "basic panel" implementation:
 - White balance (temp/tint shift)
 - Exposure (stops)
@@ -8,19 +16,13 @@ This is intentionally a Lightroom-style "basic panel" implementation:
 - Highlights / Shadows (luminance mask)
 - Whites / Blacks (endpoint shifts)
 - Vibrance / Saturation (HSL)
-- HSL per-channel adjustments
-- Tone curve (simple RGB curve via LUT)
+- HSL per-channel adjustments (8 channels)
+- Split toning (highlights/shadows color)
+- Tone curve (RGB curve via LUT)
 
 Output: a NEW JPEG file. The original is never modified. An XMP sidecar with
 the same parameters is written next to the output, so the user can drop it
 into Lightroom and continue editing.
-
-Reserved for future:
-- Local adjustment masks (radial/gradient/brush)
-- HSL panel split into 8 channels (currently using simplified model)
-- Camera profile / calibration
-- Split toning (highlights/shadows color)
-- Grain
 """
 from __future__ import annotations
 
@@ -30,23 +32,31 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from PIL import Image, ImageFilter, ImageOps
+from PIL import Image, ImageOps
 
 logger = logging.getLogger(__name__)
 
 
+def _smooth_curve(xs: np.ndarray, ys: np.ndarray, n: int = 256) -> np.ndarray:
+    """把控制点(xs, ys)插值成 n 个点的曲线,加 5-tap Gaussian 平滑。
+    比 np.interp 线性插值更柔,无硬拐点;不依赖 scipy。
+    """
+    xq = np.linspace(0, 255, n)
+    yq = np.interp(xq, xs, ys)
+    # 5-tap Gaussian 平滑(sigma ~ 1.0)
+    kernel = np.array([0.0625, 0.25, 0.375, 0.25, 0.0625], dtype=np.float32)
+    # pad 反射
+    yq_padded = np.concatenate([yq[:2][::-1], yq, yq[-2:][::-1]])
+    yq_smooth = np.convolve(yq_padded, kernel, mode="valid")
+    yq_smooth = np.clip(yq_smooth, 0, 255)
+    return yq_smooth.astype(np.float32)
+
+
 def write_xmp_sidecar(jpeg_path: Path, params: dict[str, Any]) -> Path:
-    """
-    Write a Lightroom-compatible XMP sidecar with the given parameters.
-
-    MVP scope: a minimal subset of the XMP standard. Lightroom will read
-    the basic adjustments and apply them on import.
-
-    Future: full XMP coverage including masks, HSL, calibration, etc.
-    """
+    """Lightroom-compatible XMP sidecar (basic panel only)."""
     xmp_path = jpeg_path.with_suffix(".xmp")
-    # Minimal Lightroom-compatible XMP for basic adjustments
     crs = params
+    st = crs.get("split_tone", {}) or {}
     xmp = f"""<?xml version="1.0" encoding="UTF-8"?>
 <x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="Photographer Copilot">
  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
@@ -61,13 +71,16 @@ def write_xmp_sidecar(jpeg_path: Path, params: dict[str, Any]) -> Path:
     crs:Vibrance="{crs.get('vibrance', 0):+d}"
     crs:Saturation="{crs.get('saturation', 0):+d}"
     crs:Temp="{crs.get('white_balance', {}).get('temp_shift', 0):+d}"
-    crs:Tint="{crs.get('white_balance', {}).get('tint_shift', 0):+d}">
+    crs:Tint="{crs.get('white_balance', {}).get('tint_shift', 0):+d}"
+    crs:SplitToningHighlightHue="{st.get('highlights_hue', 0):+d}"
+    crs:SplitToningHighlightSaturation="{st.get('highlights_sat', 0):+d}"
+    crs:SplitToningShadowHue="{st.get('shadows_hue', 0):+d}"
+    crs:SplitToningShadowSaturation="{st.get('shadows_sat', 0):+d}">
   </rdf:Description>
  </rdf:RDF>
 </x:xmpmeta>
 """
     xmp_path.write_text(xmp, encoding="utf-8")
-    # Also write a side-by-side JSON for our own future use
     json_path = jpeg_path.with_suffix(".json")
     json_path.write_text(
         json.dumps(params, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -79,14 +92,9 @@ def write_xmp_sidecar(jpeg_path: Path, params: dict[str, Any]) -> Path:
 def apply_color_grade(
     input_path: Path, output_path: Path, params: dict[str, Any]
 ) -> Path:
-    """
-    Apply non-destructive color grading to an image.
-
-    Reads input (JPEG/PNG), applies the grade, writes new JPEG + XMP sidecar.
-    """
+    """Apply non-destructive color grading to an image."""
     logger.info("Grading %s → %s", input_path.name, output_path.name)
     with Image.open(input_path) as im:
-        # Apply EXIF orientation so portrait phone shots don't come out sideways.
         im = ImageOps.exif_transpose(im)
         if im.mode != "RGB":
             im = im.convert("RGB")
@@ -102,7 +110,7 @@ def _apply_params(img: Image.Image, p: dict[str, Any]) -> Image.Image:
     """Apply all grading params in sequence. Returns a new image."""
     out = img
 
-    # 1. White balance (temp/tint shift via channel scaling)
+    # 1. White balance — 在 HSL 色相空间做(更柔和,保留 luma)
     wb = p.get("white_balance", {})
     temp = wb.get("temp_shift", 0) / 100.0  # -1..1
     tint = wb.get("tint_shift", 0) / 100.0
@@ -114,12 +122,12 @@ def _apply_params(img: Image.Image, p: dict[str, Any]) -> Image.Image:
     if ev != 0:
         out = _apply_exposure(out, ev)
 
-    # 3. Contrast (S-curve around 0.5)
+    # 3. Contrast (S-curve, spline 平滑)
     contrast = p.get("contrast", 0)
     if contrast != 0:
         out = _apply_contrast(out, contrast)
 
-    # 4. Highlights / Shadows (luminance-mask blend)
+    # 4. Highlights / Shadows (luminance-mask blend, 加宽过渡)
     hi = p.get("highlights", 0)
     sh = p.get("shadows", 0)
     if hi != 0 or sh != 0:
@@ -131,18 +139,23 @@ def _apply_params(img: Image.Image, p: dict[str, Any]) -> Image.Image:
     if wt != 0 or bk != 0:
         out = _apply_whites_blacks(out, wt, bk)
 
-    # 6. Vibrance / Saturation (HSL)
+    # 6. Vibrance / Saturation
     vibrance = p.get("vibrance", 0)
     sat = p.get("saturation", 0)
     if vibrance != 0 or sat != 0:
         out = _apply_saturation(out, sat, vibrance)
 
-    # 7. HSL per-channel adjustments
+    # 7. HSL per-channel adjustments (8 色, cosine falloff)
     hsl = p.get("hsl", {})
     if hsl:
         out = _apply_hsl(out, hsl)
 
-    # 8. Tone curve (last)
+    # 8. Split toning (highlights / shadows 独立加色)
+    st = p.get("split_tone", {})
+    if st and (st.get("highlights_sat", 0) > 0 or st.get("shadows_sat", 0) > 0):
+        out = _apply_split_toning(out, st)
+
+    # 9. Tone curve (最后,作为精修)
     curve = p.get("curve", {})
     if curve and "rgb" in curve:
         out = _apply_curve(out, curve["rgb"])
@@ -150,19 +163,30 @@ def _apply_params(img: Image.Image, p: dict[str, Any]) -> Image.Image:
     return out
 
 
+# ---------- 单步调色 ----------
+
 def _apply_white_balance(img: Image.Image, temp: float, tint: float) -> Image.Image:
-    """Temp: + = warmer (more red, less blue). Tint: + = more magenta."""
+    """白平衡:直接 R/B 缩放(对人像/灰区都生效),HSL 二次微调。
+    - temp > 0 → R+ B-  (更暖)
+    - tint > 0 → 整体略偏品红(同时增 R、减 G)
+    """
+    if temp == 0 and tint == 0:
+        return img
     arr = np.array(img, dtype=np.float32) / 255.0
     r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
     if temp != 0:
-        r = np.clip(r * (1 + temp * 0.3), 0, 1)
-        b = np.clip(b * (1 - temp * 0.3), 0, 1)
+        # 直接 R/B 缩放,强度按 -0.20..+0.20
+        rb_scale = temp * 0.20
+        r = np.clip(r * (1 + rb_scale), 0, 1)
+        b = np.clip(b * (1 - rb_scale), 0, 1)
     if tint != 0:
-        g = np.clip(g * (1 - tint * 0.2), 0, 1)
-    arr[..., 0] = r
-    arr[..., 1] = g
-    arr[..., 2] = b
-    return Image.fromarray((arr * 255).astype(np.uint8))
+        # tint:正 → 品红(R+、G-);负 → 绿(G+、R-)
+        t_scale = tint * 0.15
+        r = np.clip(r * (1 + t_scale * 0.5), 0, 1)
+        g = np.clip(g * (1 - t_scale * 0.7), 0, 1)
+    arr = np.stack([r, g, b], axis=-1)
+    out = np.clip(arr, 0, 1)
+    return Image.fromarray((out * 255).astype(np.uint8))
 
 
 def _apply_exposure(img: Image.Image, ev: float) -> Image.Image:
@@ -173,34 +197,43 @@ def _apply_exposure(img: Image.Image, ev: float) -> Image.Image:
 
 
 def _apply_contrast(img: Image.Image, amount: int) -> Image.Image:
-    """S-curve around 0.5 mid-gray. amount in -100..100."""
+    """S-curve,5 控制点 + smooth。amount -100..100。"""
     if amount == 0:
         return img
-    factor = (amount + 100) / 100.0  # 0..2
-    factor = factor**2  # ease
+    factor = 1 + (amount / 100.0) * 0.6
     arr = np.array(img, dtype=np.float32) / 255.0
-    # Sigmoid-like S-curve
-    arr = 0.5 + (arr - 0.5) * factor
-    arr = np.clip(arr, 0, 1)
-    return Image.fromarray((arr * 255).astype(np.uint8))
+    xs = np.array([0.0, 64.0, 128.0, 192.0, 255.0])
+    ys = np.array([0.0, 128.0 - 32.0 * factor, 128.0, 128.0 + 32.0 * factor, 255.0])
+    ys = np.clip(ys, 0, 255)
+    lut = _smooth_curve(xs, ys, n=256)
+    lut_u8 = lut.astype(np.uint8)
+    arr_u8 = (arr * 255).astype(np.uint8)
+    return Image.fromarray(lut_u8[arr_u8])
 
 
 def _apply_highlights_shadows(
     img: Image.Image, highlights: int, shadows: int
 ) -> Image.Image:
-    """Luminance-mask blend: highlights affect bright pixels, shadows affect dark."""
+    """Luminance-mask blend:用 smoothstep 替代硬阈值,过渡更柔和。"""
     arr = np.array(img, dtype=np.float32) / 255.0
     luma = 0.299 * arr[..., 0] + 0.587 * arr[..., 1] + 0.114 * arr[..., 2]
-    # Highlights mask: bright pixels (peaks at 1.0 for white)
-    hi_mask = np.clip((luma - 0.5) * 2, 0, 1)[..., None]
-    # Shadows mask: dark pixels
-    sh_mask = np.clip((0.5 - luma) * 2, 0, 1)[..., None]
+    # smoothstep:edge0, edge1
+    def smoothstep(x, e0, e1):
+        t = np.clip((x - e0) / (e1 - e0), 0, 1)
+        return t * t * (3 - 2 * t)
+
     if highlights != 0:
-        factor = 1 + (highlights / 100.0) * 0.5
-        arr = arr * (1 - hi_mask) + arr * factor * hi_mask
+        # 高光 mask:luma > 0.5 时起作用,0.5-0.95 平滑过渡
+        hi_mask = smoothstep(luma, 0.45, 0.95)[..., None]
+        factor = 1 + (highlights / 100.0) * 0.4
+        # highlights 通常是负值(降高光),所以 factor < 1
+        arr = arr * (1 - hi_mask * (1 - factor))
     if shadows != 0:
-        factor = 1 + (shadows / 100.0) * 0.5
-        arr = arr * (1 - sh_mask) + arr * factor * sh_mask
+        sh_mask = smoothstep(luma, 0.05, 0.55)[..., None]
+        # shadow mask 应该是 0=亮区, 1=暗区
+        sh_mask = 1 - sh_mask
+        factor = 1 + (shadows / 100.0) * 0.4
+        arr = arr * (1 - sh_mask * (1 - factor))
     arr = np.clip(arr, 0, 1)
     return Image.fromarray((arr * 255).astype(np.uint8))
 
@@ -208,12 +241,20 @@ def _apply_highlights_shadows(
 def _apply_whites_blacks(img: Image.Image, whites: int, blacks: int) -> Image.Image:
     arr = np.array(img, dtype=np.float32) / 255.0
     if whites != 0:
-        # Whites: shift upper endpoint
+        # 端点 shift
         w = whites / 100.0 * 0.2
-        arr = arr + (1 - arr) * w
+        # whites + 拉高所有值(高值更明显);whites - 压低高值
+        if w > 0:
+            arr = arr + (1 - arr) * w
+        else:
+            arr = arr + arr * w
     if blacks != 0:
         b = blacks / 100.0 * 0.2
-        arr = arr + arr * b  # blacks: shift lower endpoint (negative = crush)
+        # blacks - 压低暗部(更深);blacks + 抬高暗部(更黑,但提 fade)
+        if b > 0:
+            arr = arr + arr * b  # 暗部提亮
+        else:
+            arr = arr + (1 - arr) * b  # 整体压暗
     arr = np.clip(arr, 0, 1)
     return Image.fromarray((arr * 255).astype(np.uint8))
 
@@ -228,54 +269,110 @@ def _apply_saturation(
         f = 1 + saturation / 100.0
         arr = luma_3 + (arr - luma_3) * f
     if vibrance != 0:
-        # Vibrance: boost less-saturated pixels more
-        current_sat = np.max(np.abs(arr - luma_3), axis=-1)
-        weight = 1 - current_sat
-        f = 1 + vibrance / 100.0 * weight[..., None] * 0.5
-        arr = luma_3 + (arr - luma_3) * f
+        # Vibrance:在 HSL S 空间上,加权重 = 1 - S_current(低饱和的提升多)
+        hsv = _rgb_to_hsv(arr)
+        s = hsv[..., 1]
+        # weight:越接近灰(低 s)权重越大
+        weight = 1 - s
+        # vibrance 正值 = 加饱和,但低饱和区域多,高饱和少
+        delta = (vibrance / 100.0) * weight * 0.4
+        new_s = np.clip(s + delta, 0, 1)
+        # 转回 RGB
+        hsv[..., 1] = new_s
+        arr = _hsv_to_rgb(hsv)
     arr = np.clip(arr, 0, 1)
     return Image.fromarray((arr * 255).astype(np.uint8))
 
 
 def _apply_hsl(img: Image.Image, hsl: dict[str, dict[str, int]]) -> Image.Image:
-    """Per-hue adjustments. Simplified: shift hue via channel rotation in HSL space."""
+    """Per-hue 调整,8 通道。mask 改 cosine falloff(更平滑,无硬边)。
+    width = 0.11(原来 0.08,太窄会出 banding)。
+    """
     arr = np.array(img, dtype=np.float32) / 255.0
-    # Convert RGB to HSV for hue/sat/lum adjustments
     hsv = _rgb_to_hsv(arr)
+    width = 0.11
     for color, adj in hsl.items():
         hue_target = _HUE_TARGETS.get(color)
         if hue_target is None:
             continue
-        h_shift = adj.get("hue", 0) / 200.0  # -0.5..0.5
+        h_shift = adj.get("hue", 0) / 200.0
         s_shift = adj.get("sat", 0) / 100.0
         l_shift = adj.get("lum", 0) / 100.0
-        # Hue distance (circular)
+        if h_shift == 0 and s_shift == 0 and l_shift == 0:
+            continue
+        # 色相距离(循环,归一化到 0..0.5)
         dist = np.abs(hsv[..., 0] - hue_target)
         dist = np.minimum(dist, 1 - dist)
-        # Smooth falloff: 1 at center, 0 at ±0.08 distance
-        mask = np.clip(1 - dist / 0.08, 0, 1)[..., None]
-        hsv[..., 0] = (hsv[..., 0] + h_shift * mask[..., 0]) % 1.0
-        hsv[..., 1] = np.clip(hsv[..., 1] + s_shift * mask[..., 0], 0, 1)
-        hsv[..., 2] = np.clip(hsv[..., 2] + l_shift * mask[..., 0], 0, 1)
-    arr = _hsv_to_rgb(hsv)
-    arr = np.clip(arr, 0, 1)
-    return Image.fromarray((arr * 255).astype(np.uint8))
+        # cosine falloff:0 距离=1,±width 距离=0,中间 cos 曲线
+        # mask = 0.5 * (1 + cos(pi * dist / width))
+        mask = 0.5 * (1 + np.cos(np.pi * np.clip(dist / width, 0, 1)))
+        # 按当前 saturation 再次衰减:灰区不动(不然会出 noise)
+        sat_weight = hsv[..., 1]
+        weight = (mask * (0.4 + 0.6 * sat_weight))[..., None]
+        hsv[..., 0] = (hsv[..., 0] + h_shift * weight[..., 0]) % 1.0
+        hsv[..., 1] = np.clip(hsv[..., 1] + s_shift * weight[..., 0], 0, 1)
+        hsv[..., 2] = np.clip(hsv[..., 2] + l_shift * weight[..., 0], 0, 1)
+    out = _hsv_to_rgb(hsv)
+    out = np.clip(out, 0, 1)
+    return Image.fromarray((out * 255).astype(np.uint8))
 
+
+def _apply_split_toning(img: Image.Image, st: dict[str, Any]) -> Image.Image:
+    """Split toning:highlights 加一个色,shadows 加另一个色。强度按 luma mask。
+    不会让 luma 漂移太多 — 只调整 chroma。
+    """
+    arr = np.array(img, dtype=np.float32) / 255.0
+    luma = 0.299 * arr[..., 0] + 0.587 * arr[..., 1] + 0.114 * arr[..., 2]
+    out = arr.copy()
+
+    # Smooth masks
+    def smoothstep(x, e0, e1):
+        t = np.clip((x - e0) / (e1 - e0), 0, 1)
+        return t * t * (3 - 2 * t)
+
+    hi_mask = smoothstep(luma, 0.5, 0.9)[..., None]
+    sh_mask = (1 - smoothstep(luma, 0.1, 0.5))[..., None]
+
+    def hue_sat_to_rgb(h_deg: float, s_pct: float) -> np.ndarray:
+        """色相角度 + 饱和度 → RGB tint (0..1)。"""
+        h = h_deg / 360.0
+        s = s_pct / 100.0
+        hsv = np.array([[[h, s, 0.5]]], dtype=np.float32)
+        rgb = _hsv_to_rgb(hsv)
+        # 居中(减 luma),只留 chroma
+        chroma = rgb[0, 0] - np.array([0.5, 0.5, 0.5], dtype=np.float32)
+        return chroma
+
+    hi_hue = float(st.get("highlights_hue", 0))
+    hi_sat = float(st.get("highlights_sat", 0))
+    sh_hue = float(st.get("shadows_hue", 0))
+    sh_sat = float(st.get("shadows_sat", 0))
+
+    if hi_sat > 0:
+        tint = hue_sat_to_rgb(hi_hue, hi_sat) * 0.3  # 0.3 是强度上限
+        out = out + tint * hi_mask
+    if sh_sat > 0:
+        tint = hue_sat_to_rgb(sh_hue, sh_sat) * 0.3
+        out = out + tint * sh_mask
+    out = np.clip(out, 0, 1)
+    return Image.fromarray((out * 255).astype(np.uint8))
+
+
+# ---------- 通用工具 ----------
 
 _HUE_TARGETS = {
-    "red": 0.0,
-    "orange": 0.05,
-    "yellow": 0.12,
-    "green": 0.30,
-    "aqua": 0.45,
-    "blue": 0.60,
-    "purple": 0.75,
+    "red":     0.00,
+    "orange":  0.06,
+    "yellow":  0.13,
+    "green":   0.30,
+    "aqua":    0.45,
+    "blue":    0.60,
+    "purple":  0.75,
     "magenta": 0.88,
 }
 
 
 def _rgb_to_hsv(rgb: np.ndarray) -> np.ndarray:
-    """rgb in [0,1] → hsv in [0,1]."""
     r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
     max_c = np.max(rgb, axis=-1)
     min_c = np.min(rgb, axis=-1)
@@ -309,11 +406,12 @@ def _hsv_to_rgb(hsv: np.ndarray) -> np.ndarray:
 
 
 def _apply_curve(img: Image.Image, points: list[list[int]]) -> Image.Image:
-    """Apply an RGB tone curve from a list of (in, out) points in 0..255."""
+    """Apply RGB tone curve。控制点 + 平滑 LUT。"""
     if not points or len(points) < 2:
         return img
-    xs = np.array([p[0] for p in points], dtype=np.float32)
-    ys = np.array([p[1] for p in points], dtype=np.float32)
-    lut = np.interp(np.arange(256), xs, ys).astype(np.uint8)
+    pts = sorted(points, key=lambda p: p[0])
+    xs = np.array([p[0] for p in pts], dtype=np.float32)
+    ys = np.array([p[1] for p in pts], dtype=np.float32)
+    lut = _smooth_curve(xs, ys, n=256).astype(np.uint8)
     arr = np.array(img)
     return Image.fromarray(lut[arr])

@@ -1,92 +1,216 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { ChatBox } from "./components/ChatBox";
 import { Sidebar, type ViewKey } from "./components/Sidebar";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { GradeView } from "./views/GradeView";
 import { CullView } from "./views/CullView";
 import type { SelectedTarget } from "./components/WorkspacePanel";
-import type { ChatMessage, TaskProgress as TaskProgressType } from "./lib/api-types";
+import type {
+  ChatMessage,
+  Conversation,
+  TaskProgress as TaskProgressType,
+} from "./lib/api-types";
 import {
   getTask,
   onTaskEvent,
   sendChat,
   type PhotoInfo,
 } from "./lib/api";
-import { usePersistedState, clearPersisted } from "./lib/usePersistedState";
+import { usePersistedState } from "./lib/usePersistedState";
 
 const LS_KEYS = {
-  messages: "phc.messages.v1",
+  // v0.3.0+: 历史 messages key 改名为 legacy 留迁移用
+  legacyMessages: "phc.messages.v1",
+  conversations: "phc.conversations.v1",
+  activeConvId: "phc.activeConv.v1",
   activeTask: "phc.activeTask.v1",
   taskPhotos: "phc.taskPhotos.v1",
   view: "phc.view.v1",
 };
 
-// Cap on persisted messages / photos to keep localStorage usage sane.
-const MAX_PERSISTED_MESSAGES = 200;
+// Cap on persisted items to keep localStorage usage sane.
+const MAX_PERSISTED_MESSAGES_PER_CONV = 200;
+const MAX_PERSISTED_CONVERSATIONS = 30;
 const MAX_PERSISTED_PHOTOS = 200;
+
+const CONV_TITLE_MAX = 28;
+const NEW_CONVERSATION_TITLE = "新对话";
+
+/** 从用户消息里挑一句能当标题的(去前后空白 + 截断) */
+function makeTitleFromText(text: string): string {
+  const cleaned = text.replace(/\s+/g, " ").trim();
+  if (!cleaned) return NEW_CONVERSATION_TITLE;
+  return cleaned.length > CONV_TITLE_MAX
+    ? cleaned.slice(0, CONV_TITLE_MAX) + "…"
+    : cleaned;
+}
+
+function makeConversation(firstUserText?: string): Conversation {
+  const now = Date.now();
+  return {
+    id: `conv-${now}-${Math.random().toString(36).slice(2, 8)}`,
+    title: firstUserText ? makeTitleFromText(firstUserText) : NEW_CONVERSATION_TITLE,
+    messages: [],
+    createdAt: now,
+    updatedAt: now,
+  };
+}
 
 // ----- Component -----
 const App: React.FC = () => {
-  const [messages, setMessages] = usePersistedState<ChatMessage[]>(LS_KEYS.messages, []);
+  // 多会话(每个对话独立 messages 上下文,互不串)。localStorage 持久化。
+  // v0.3.0 升级:历史 phc.messages.v1 在 mount 时一次性迁到第一个对话里,
+  // 之后用新版 schema。
+  const [conversations, setConversations] = usePersistedState<Conversation[]>(
+    LS_KEYS.conversations,
+    [],
+  );
+  const [activeConvId, setActiveConvId] = usePersistedState<string>(
+    LS_KEYS.activeConvId,
+    "",
+  );
+  // 旧版 key 一次性迁移
+  useEffect(() => {
+    try {
+      const legacyRaw = localStorage.getItem(LS_KEYS.legacyMessages);
+      if (!legacyRaw) return;
+      const legacy = JSON.parse(legacyRaw) as ChatMessage[];
+      if (!Array.isArray(legacy) || legacy.length === 0) {
+        localStorage.removeItem(LS_KEYS.legacyMessages);
+        return;
+      }
+      setConversations((cur) => {
+        if (cur.length > 0) {
+          // 用户在另一个标签 / 浏览器已经升级过,清掉 legacy
+          localStorage.removeItem(LS_KEYS.legacyMessages);
+          return cur;
+        }
+        const firstUserText = legacy.find((m) => m.role === "user")?.text;
+        const conv = makeConversation(firstUserText);
+        conv.messages = legacy;
+        localStorage.removeItem(LS_KEYS.legacyMessages);
+        return [conv];
+      });
+      setActiveConvId((cur) => cur || "");
+    } catch (e) {
+      // ignore
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // 派生:当前 active conversation。可能是新建的、用户切换的、或者已被删的(被删 → 回落第一项)
+  const activeConversation = useMemo<Conversation | null>(() => {
+    if (conversations.length === 0) return null;
+    const found = conversations.find((c) => c.id === activeConvId);
+    if (found) return found;
+    return conversations[0];
+  }, [conversations, activeConvId]);
+
+  const activeConvIdEffective = activeConversation?.id ?? "";
+
+  // 当前会话 messages(派生)
+  const messages = activeConversation?.messages ?? [];
+
   const [streamingText, setStreamingText] = useState<string>("");
-  const [activeTask, setActiveTask] = usePersistedState<TaskProgressType | null>(LS_KEYS.activeTask, null);
-  const [taskPhotos, setTaskPhotos] = usePersistedState<PhotoInfo[]>(LS_KEYS.taskPhotos, []);
+  const [activeTask, setActiveTask] = usePersistedState<TaskProgressType | null>(
+    LS_KEYS.activeTask,
+    null,
+  );
+  const [taskPhotos, setTaskPhotos] = usePersistedState<PhotoInfo[]>(
+    LS_KEYS.taskPhotos,
+    [],
+  );
   const [toast, setToast] = useState<{ level: "info" | "warn" | "error"; text: string } | null>(null);
   const [busy, setBusy] = useState(false);
   const [view, setView] = usePersistedState<ViewKey>(LS_KEYS.view, "chat");
-  /** Bumped when uploads complete so views refetch their folder list. */
   const [refreshKey, setRefreshKey] = useState(0);
-  // Map<taskId, unsubscribe> — keyed by task id so that when the user
-  // switches from task A to task B (or starts a new task while an old
-  // one's SSE handshake is still in-flight), the old cleanup only ever
-  // closes the *old* subscription. With a single `useRef<Unlisten>` we
-  // had a race where the old cleanup could close a freshly-stored new
-  // subscription if the new one finished its async setup between the
-  // cleanup call and the next render.
   const taskUnlistenRef = useRef<Map<string, () => void>>(new Map());
-  // Keep the latest activeTask available inside async callbacks (e.g. the
-  // SSE handler registered with onTaskEvent) without having to rebuild the
-  // subscription every time activeTask changes.
   const activeTaskRef = useRef<TaskProgressType | null>(null);
-  useEffect(() => { activeTaskRef.current = activeTask; }, [activeTask]);
+  useEffect(() => {
+    activeTaskRef.current = activeTask;
+  }, [activeTask]);
 
-  // ----- Toast helper -----
+  // ---- helpers:会话管理 ----
+  const handleNewConversation = () => {
+    const conv = makeConversation();
+    setConversations((cur) => {
+      const next = [conv, ...cur];
+      // 超过 cap 时丢最旧的(不丢用户当前正看的)
+      return next.length > MAX_PERSISTED_CONVERSATIONS
+        ? next.slice(0, MAX_PERSISTED_CONVERSATIONS)
+        : next;
+    });
+    setActiveConvId(conv.id);
+    setStreamingText("");
+    setBusy(false);
+    if (view !== "chat") setView("chat");
+  };
+
+  const handleSelectConversation = (id: string) => {
+    if (id === activeConvIdEffective) return;
+    setActiveConvId(id);
+    setStreamingText("");
+    setBusy(false);
+  };
+
+  const handleDeleteConversation = (id: string) => {
+    setConversations((cur) => {
+      if (cur.length <= 1) {
+        // 删掉最后一个就只剩 0,自动建一个新的
+        const fresh = makeConversation();
+        // 注意:setActiveConvId 在 setConversations 之前/之后调用都行,
+        // 这里依赖 setActiveConvId 后续 effect 兜底
+        return [fresh];
+      }
+      const next = cur.filter((c) => c.id !== id);
+      return next;
+    });
+    // 如果删的是当前 active,会触发 useMemo 落到第一项;这里不需要手动 setActiveConvId
+  };
+
+  const handleClearCurrentConversation = () => {
+    if (!activeConversation) return;
+    if (!confirm(`清空当前对话「${activeConversation.title}」的消息?(不影响其他对话)`)) {
+      return;
+    }
+    setConversations((cur) =>
+      cur.map((c) =>
+        c.id === activeConvIdEffective
+          ? { ...c, messages: [], updatedAt: Date.now() }
+          : c,
+      ),
+    );
+    setStreamingText("");
+  };
+
+  // ---- Toast ----
   const showToast = (level: "info" | "warn" | "error", text: string) => {
     setToast({ level, text });
     setTimeout(() => setToast(null), 4000);
   };
 
-  // ----- Subscribe to current task's events -----
+  // ---- Subscribe to current task's events ----
   useEffect(() => {
     if (!activeTask) return;
     const taskId = activeTask.task_id;
     let cancelled = false;
 
     const subscribe = async () => {
-      // If we already had a subscription for this exact task id, close
-      // it before opening a new one. (This shouldn't happen normally —
-      // useEffect only re-runs when the task_id changes — but is the
-      // safe thing to do in StrictMode dev double-invoke.)
       const existing = taskUnlistenRef.current.get(taskId);
       if (existing) {
         existing();
         taskUnlistenRef.current.delete(taskId);
       }
 
-      // If we recovered this task from localStorage on page load, also pull the
-      // canonical server-side state so we don't show stale "running" forever if
-      // the task already finished while the tab was reloading.
       if (activeTask.status !== "done") {
         try {
           const res = await getTask(taskId);
           if (res.task && res.task.status === "done") {
-            // Task finished during the reload — sync and skip subscription
             syncTaskDoneFromServer(res.task, res.photos);
             return;
           }
         } catch {
-          // Server may not have this task (e.g. it was wiped) — fall through to
-          // attempt subscription anyway, then show an error if it fails.
+          /* fall through */
         }
       }
 
@@ -98,11 +222,6 @@ const App: React.FC = () => {
         },
         (status) => {
           if (cancelled) return;
-          // Surface the SSE connection state to the user. We use a
-          // *warn* (not error) for transient "connecting" because the
-          // browser auto-reconnects on its own; the user just sees a
-          // toast so they know progress is paused. Hard "closed" means
-          // the browser gave up — the 5s polling fallback will take over.
           if (status.state === "closed") {
             showToast("warn", "任务进度连接中断,5 秒轮询兜底中");
           } else if (status.state === "error") {
@@ -111,11 +230,6 @@ const App: React.FC = () => {
         },
       );
       if (cancelled) {
-        // React already unmounted this effect by the time onTaskEvent
-        // resolved. Close the EventSource we just opened so we don't
-        // leak it. The Map.delete is also defensive — if another
-        // effect for the same taskId already overwrote the entry,
-        // we'd otherwise close a *valid* new subscription.
         unlisten();
         return;
       }
@@ -125,10 +239,6 @@ const App: React.FC = () => {
 
     return () => {
       cancelled = true;
-      // Only close the subscription that *this* effect opened. We
-      // look it up by taskId, not by "whatever is currently in the
-      // ref", so we can't accidentally close a freshly-opened
-      // subscription owned by a newer effect.
       const u = taskUnlistenRef.current.get(taskId);
       if (u) {
         u();
@@ -138,12 +248,7 @@ const App: React.FC = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTask?.task_id]);
 
-  // ----- Polling fallback -----
-  // Belt-and-suspenders: even if SSE drops / handler never fires (e.g. an
-  // early render unmounted the subscription), poll the server every 5s and
-  // promote activeTask to "done" as soon as the server says so. Without this
-  // a user could see the task stuck at 100% / spinning forever and the
-  // start button disabled.
+  // ---- Polling fallback ----
   useEffect(() => {
     if (!activeTask) return;
     if (activeTask.status === "done") return;
@@ -157,17 +262,12 @@ const App: React.FC = () => {
           syncTaskDoneFromServer(res.task, res.photos);
         }
       } catch (e: any) {
-        // 404 means the server has forgotten this task (restart, cleared DB,
-        // etc.) — there's no point polling any more. Drop the stale
-        // activeTask so the UI unblocks; on next user action the server
-        // will create a fresh task.
         const msg = e?.message || "";
         if (msg.includes("404") || msg.toLowerCase().includes("not found")) {
           stopped = true;
           setActiveTask(null);
           showToast("warn", "之前的任务已不存在(可能 server 重启),已清空。请重新开始。");
         }
-        // Other errors (network blip, 5xx) — just retry next tick.
       }
     };
     const interval = setInterval(tick, 5000);
@@ -178,8 +278,6 @@ const App: React.FC = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTask?.task_id]);
 
-  // Helper used by both the SSE fast path and the polling fallback. Centralized
-  // so both routes promote the task to "done" with identical shape.
   const syncTaskDoneFromServer = (serverTask: any, serverPhotos: PhotoInfo[]) => {
     const nextStatus = serverTask.status === "done" ? "done" : serverTask.status;
     setActiveTask((cur) => {
@@ -190,6 +288,7 @@ const App: React.FC = () => {
         current: serverTask.progress_current ?? serverPhotos.length,
         total: serverTask.progress_total ?? serverPhotos.length,
         summary: serverTask.summary ?? cur.summary,
+        output_folder: serverTask.output_folder ?? (cur as any).output_folder,
       };
     });
     setTaskPhotos(serverPhotos);
@@ -197,20 +296,21 @@ const App: React.FC = () => {
     setRefreshKey((k) => k + 1);
   };
 
-  // ----- Task event handler -----
+  // ---- Task event handler ----
   const handleTaskEvent = (event: string, payload: any) => {
     switch (event) {
       case "task_started":
         setActiveTask((t) =>
           t
-            ? { ...t, status: "running", total: 0 }
+            ? { ...t, status: "running", total: 0, output_folder: payload.output }
             : {
                 task_id: payload.task_id,
                 type: payload.type,
                 status: "running",
                 current: 0,
                 total: 0,
-              }
+                output_folder: payload.output,
+              },
         );
         setTaskPhotos([]);
         break;
@@ -224,7 +324,7 @@ const App: React.FC = () => {
                 currentPhoto: payload.photo,
                 stage: payload.stage,
               }
-            : t
+            : t,
         );
         break;
       case "photo_done":
@@ -243,7 +343,6 @@ const App: React.FC = () => {
               comment: payload.comment,
             } as PhotoInfo,
           ];
-          // Cap to avoid localStorage blowing up on big batches
           return next.length > MAX_PERSISTED_PHOTOS
             ? next.slice(next.length - MAX_PERSISTED_PHOTOS)
             : next;
@@ -251,9 +350,6 @@ const App: React.FC = () => {
         break;
       case "photo_failed":
         setTaskPhotos((prev) => {
-          // Use the catalog photo_id from the event when present (v0.1.4
-          // fix: backend now includes it). Fall back to prev.length+1
-          // for any pre-fix events or older server versions.
           const fallbackId = prev.length > 0
             ? Math.max(...prev.map((p) => p.id), 0) + 1
             : 1;
@@ -273,19 +369,23 @@ const App: React.FC = () => {
         });
         break;
       case "task_done":
-        // Promote to "done" via the canonical sync helper so the SSE event
-        // and the polling fallback produce identical UI. We DON'T call
-        // getTask() inside the setState updater (that would be a side effect
-        // React 18 may double-invoke in StrictMode).
         setActiveTask((t) =>
-          t ? { ...t, status: "done", summary: payload.summary } : t
+          t ? { ...t, status: "done", summary: payload.summary } : t,
         );
         showToast("info", payload.summary);
-        // Bump refreshKey so views re-fetch folder list (might find new output)
         setRefreshKey((k) => k + 1);
-        // Fire-and-forget photo sync (the poll will catch up if this fails).
         getTask(activeTaskRef.current?.task_id ?? "")
-          .then((res) => setTaskPhotos(res.photos))
+          .then((res) => {
+            setTaskPhotos(res.photos);
+            const serverTask = res.task;
+            if (serverTask?.output_folder) {
+              setActiveTask((t) =>
+                t
+                  ? { ...t, output_folder: serverTask.output_folder }
+                  : t,
+              );
+            }
+          })
           .catch(console.error);
         break;
       case "ping":
@@ -293,8 +393,11 @@ const App: React.FC = () => {
     }
   };
 
-  // ----- Start task from view (Grade/Cull) -----
-  const handleStartTask = (taskId: string, _target: SelectedTarget, type: "grade" | "cull") => {
+  const handleStartTask = (
+    taskId: string,
+    _target: SelectedTarget,
+    type: "grade" | "cull",
+  ) => {
     setActiveTask({
       task_id: taskId,
       type,
@@ -304,19 +407,49 @@ const App: React.FC = () => {
     });
   };
 
-  // ----- Photo feedback -----
   const handleFeedback = (id: number, fb: "up" | "down") => {
-    showToast("info", fb === "up" ? "已记录 👍" : "已记录 👎");
+    // 更新本地 taskPhotos 让按钮高亮
+    setTaskPhotos((cur) =>
+      cur.map((p) => (p.id === id ? { ...p, feedback: fb } : p))
+    );
+    showToast(
+      "info",
+      fb === "up" ? "已记录 👍 AI 会参考你的偏好" : "已记录 👎 AI 会避开这种风格"
+    );
   };
 
-  // ----- Send chat -----
+  // ---- Send chat ----
+  // 注意:每个对话的 messages 互相独立,handleSend 只动当前 activeConvId
+  // 对应的那一份。后端 chat 端点目前无 context(M3 单轮),所以"独立上下文"
+  // 是前端组织上的隔离 —— 这点 README 里要讲清楚,免得用户以为能跨对话续聊。
   const handleSend = async (text: string) => {
-    setMessages((prev) => {
-      const next = [...prev, { role: "user" as const, text }];
-      return next.length > MAX_PERSISTED_MESSAGES
-        ? next.slice(next.length - MAX_PERSISTED_MESSAGES)
-        : next;
-    });
+    // 如果当前没有 active conversation(空状态),先建一个
+    let convId = activeConvIdEffective;
+    if (!convId) {
+      const conv = makeConversation(text);
+      setConversations((cur) => [conv, ...cur]);
+      setActiveConvId(conv.id);
+      convId = conv.id;
+    }
+    // 把 user 消息塞进当前 conv(用 convId 而不是 effective,避免上面新建后
+    // setConversations 异步导致 updater 找不到)
+    setConversations((cur) =>
+      cur.map((c) => {
+        if (c.id !== convId) return c;
+        const next = [
+          ...c.messages,
+          { role: "user" as const, text },
+        ];
+        // 第一次发消息时把"新对话"标题改成消息摘要
+        const title = c.title === NEW_CONVERSATION_TITLE ? makeTitleFromText(text) : c.title;
+        return {
+          ...c,
+          title,
+          messages: next,
+          updatedAt: Date.now(),
+        };
+      }),
+    );
     setStreamingText("");
     setBusy(true);
     try {
@@ -324,24 +457,32 @@ const App: React.FC = () => {
         if (chunk.error) {
           setBusy(false);
           setStreamingText("");
-          setMessages((prev) => {
-            const next = [...prev, { role: "assistant" as const, text: `错误:${chunk.error}` }];
-            return next.length > MAX_PERSISTED_MESSAGES
-              ? next.slice(next.length - MAX_PERSISTED_MESSAGES)
-              : next;
-          });
+          setConversations((cur) =>
+            cur.map((c) => {
+              if (c.id !== convId) return c;
+              const next = [
+                ...c.messages,
+                { role: "assistant" as const, text: `错误:${chunk.error}` },
+              ];
+              return { ...c, messages: next, updatedAt: Date.now() };
+            }),
+          );
           return;
         }
         if (chunk.done) {
           setBusy(false);
           setStreamingText((cur) => {
             if (cur) {
-              setMessages((prev) => {
-                const next = [...prev, { role: "assistant" as const, text: cur }];
-                return next.length > MAX_PERSISTED_MESSAGES
-                  ? next.slice(next.length - MAX_PERSISTED_MESSAGES)
-                  : next;
-              });
+              setConversations((cs) =>
+                cs.map((c) => {
+                  if (c.id !== convId) return c;
+                  const next = [
+                    ...c.messages,
+                    { role: "assistant" as const, text: cur },
+                  ];
+                  return { ...c, messages: next, updatedAt: Date.now() };
+                }),
+              );
             }
             return "";
           });
@@ -352,27 +493,20 @@ const App: React.FC = () => {
     } catch (e: any) {
       setBusy(false);
       setStreamingText("");
-      setMessages((prev) => {
-        const next = [...prev, { role: "assistant" as const, text: `发送失败:${e.message || e}` }];
-        return next.length > MAX_PERSISTED_MESSAGES
-          ? next.slice(next.length - MAX_PERSISTED_MESSAGES)
-          : next;
-      });
+      setConversations((cur) =>
+        cur.map((c) => {
+          if (c.id !== convId) return c;
+          const next = [
+            ...c.messages,
+            { role: "assistant" as const, text: `发送失败:${e.message || e}` },
+          ];
+          return { ...c, messages: next, updatedAt: Date.now() };
+        }),
+      );
     }
   };
 
-  // ----- "Clear history" handler (used by Sidebar / future menu) -----
-  const handleClearHistory = () => {
-    clearPersisted(LS_KEYS.messages);
-    clearPersisted(LS_KEYS.activeTask);
-    clearPersisted(LS_KEYS.taskPhotos);
-    setMessages([]);
-    setActiveTask(null);
-    setTaskPhotos([]);
-    showToast("info", "已清空聊天记录与任务进度");
-  };
-
-  // ----- Render -----
+  // ---- Render ----
   const renderView = () => {
     switch (view) {
       case "grade":
@@ -421,7 +555,12 @@ const App: React.FC = () => {
           view={view}
           onChangeView={setView}
           propsOnSystemMessage={(msg) => showToast(msg.level, msg.text)}
-          onClearHistory={handleClearHistory}
+          conversations={conversations}
+          activeConversationId={activeConvIdEffective}
+          onSelectConversation={handleSelectConversation}
+          onNewConversation={handleNewConversation}
+          onDeleteConversation={handleDeleteConversation}
+          onClearCurrentConversation={handleClearCurrentConversation}
         />
 
         <main className="flex-1 flex flex-col min-w-0 overflow-hidden">

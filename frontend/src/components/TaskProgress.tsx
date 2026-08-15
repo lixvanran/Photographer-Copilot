@@ -1,5 +1,15 @@
 import React, { useEffect, useState } from "react";
-import { ThumbsUp, ThumbsDown, Loader2, CheckCircle2, XCircle, Clock } from "lucide-react";
+import {
+  ThumbsUp,
+  ThumbsDown,
+  Loader2,
+  CheckCircle2,
+  XCircle,
+  Clock,
+  FolderOpen,
+  Image as ImageIcon,
+  Copy,
+} from "lucide-react";
 import type { TaskProgress as TaskProgressType } from "../lib/api-types";
 import type { PhotoInfo } from "../lib/api";
 import { setPhotoFeedback } from "../lib/api";
@@ -25,12 +35,12 @@ function formatElapsed(ms: number): string {
   return `${min} 分 ${s.toString().padStart(2, "0")} 秒`;
 }
 
+function basename(p?: string | null): string {
+  if (!p) return "";
+  return p.split(/[/\\]/).pop() || p;
+}
+
 export const TaskProgress: React.FC<Props> = ({ task, photos, onFeedback }) => {
-  // Elapsed-time ticker. Only counts while the task is actively running,
-  // so when a task is done the number freezes on the final value rather
-  // than climbing forever. Helps the user feel that the app is alive
-  // even during long M3 calls (5-30s per photo) where nothing visible
-  // changes between photo_progress events.
   const [elapsed, setElapsed] = useState(0);
   useEffect(() => {
     if (!task) {
@@ -40,9 +50,6 @@ export const TaskProgress: React.FC<Props> = ({ task, photos, onFeedback }) => {
     const startedAt = Date.now();
     const isRunning = task.status !== "done" && task.status !== "failed";
     if (!isRunning) {
-      // Best effort: freeze at 0 (we don't have startedAt persisted in
-      // the task shape; the 5s polling fallback would catch up if we
-      // wanted to be fancy here).
       setElapsed(0);
       return;
     }
@@ -64,6 +71,20 @@ export const TaskProgress: React.FC<Props> = ({ task, photos, onFeedback }) => {
   const culled = photos.filter((p) => p.keep === 0).length;
   const failed = photos.filter((p) => p.status === "failed").length;
   const isRunning = task.status !== "done" && task.status !== "failed";
+  // Output 目录(grade / cull 都会在 task 完成后写到 catalog)
+  const outputFolder = (task as any).output_folder as string | undefined;
+
+  const handleOpenFolder = () => {
+    if (!outputFolder) return;
+    // 浏览器没有标准 API 直接打开本地文件夹,退化为复制路径到剪贴板
+    // (Web 模式不在 Tauri 环境下能做的就是这点了 —— 真要看就用 Finder /
+    // Explorer 粘贴路径)。
+    try {
+      navigator.clipboard?.writeText(outputFolder);
+    } catch {
+      // ignore
+    }
+  };
 
   return (
     <div className="apple-glass mx-4 mb-4 px-4 py-2.5 space-y-2" style={{ borderRadius: "14px" }}>
@@ -112,13 +133,18 @@ export const TaskProgress: React.FC<Props> = ({ task, photos, onFeedback }) => {
       <div className="flex items-center gap-3 text-xs text-zinc-600 flex-wrap">
         {task.type === "cull" && (
           <>
-            <span>✅ 保留:<span className="text-phc-green font-mono font-semibold">{kept}</span></span>
-            <span>❌ 剔除:<span className="text-red-500 font-mono font-semibold">{culled}</span></span>
+            <span>
+              ✅ 保留:<span className="text-phc-green font-mono font-semibold">{kept}</span>
+            </span>
+            <span>
+              ❌ 剔除:<span className="text-red-500 font-mono font-semibold">{culled}</span>
+            </span>
           </>
         )}
         {task.type === "grade" && (
           <span>
-            🎨 完成:<span className="text-phc-green font-mono font-semibold">
+            🎨 完成:
+            <span className="text-phc-green font-mono font-semibold">
               {photos.filter((p) => p.status === "graded").length}
             </span>
           </span>
@@ -126,11 +152,35 @@ export const TaskProgress: React.FC<Props> = ({ task, photos, onFeedback }) => {
         {failed > 0 && <span className="text-red-500">失败:{failed}</span>}
         {task.currentPhoto && isRunning && (
           <span className="text-zinc-700 truncate font-mono">
-            · {STAGE_LABEL[task.stage ?? ""] || task.stage || "处理中"}:<span className="text-phc-accent ml-0.5">{task.currentPhoto}</span>
+            · {STAGE_LABEL[task.stage ?? ""] || task.stage || "处理中"}:
+            <span className="text-phc-accent ml-0.5">{task.currentPhoto}</span>
           </span>
         )}
       </div>
 
+      {/* Output 目录(cull / grade 完成后显示,点按钮复制路径到剪贴板) */}
+      {outputFolder && !isRunning && (
+        <div className="flex items-center gap-2 text-[11px] text-zinc-500 border-t border-black/5 pt-1.5">
+          <FolderOpen size={11} className="shrink-0" />
+          <code
+            className="font-mono truncate flex-1"
+            title={outputFolder}
+          >
+            {outputFolder}
+          </code>
+          <button
+            onClick={handleOpenFolder}
+            className="apple-btn apple-btn-secondary shrink-0"
+            style={{ padding: "2px 8px" }}
+            title="复制 output 目录路径(在文件管理器里粘贴打开)"
+          >
+            <Copy size={10} />
+            复制路径
+          </button>
+        </div>
+      )}
+
+      {/* Grade 任务的 photo 列表(带 👍/👎) */}
       {task.type === "grade" && photos.length > 0 && (
         <div className="max-h-32 overflow-y-auto border-t border-black/5 pt-1.5 space-y-0.5">
           {photos
@@ -138,6 +188,17 @@ export const TaskProgress: React.FC<Props> = ({ task, photos, onFeedback }) => {
             .slice(-10)
             .map((p) => (
               <PhotoFeedbackRow key={p.id} photo={p} onFeedback={onFeedback} />
+            ))}
+        </div>
+      )}
+
+      {/* Cull 任务的 photo 列表(保留 / 剔除 / 失败,带 output 链接) */}
+      {task.type === "cull" && photos.length > 0 && !isRunning && (
+        <div className="max-h-40 overflow-y-auto border-t border-black/5 pt-1.5 space-y-0.5">
+          {photos
+            .filter((p) => p.keep === 1 || p.keep === 0 || p.status === "failed")
+            .map((p) => (
+              <CullPhotoRow key={p.id} photo={p} />
             ))}
         </div>
       )}
@@ -166,7 +227,7 @@ const PhotoFeedbackRow: React.FC<{
   return (
     <div className="flex items-center justify-between text-[11px] py-0.5 group">
       <span className="truncate font-mono text-zinc-600" title={photo.source_path}>
-        {photo.source_path.split(/[/\\]/).pop()}
+        {basename(photo.source_path)}
       </span>
       <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
         <button
@@ -188,6 +249,42 @@ const PhotoFeedbackRow: React.FC<{
           <ThumbsDown size={11} />
         </button>
       </div>
+    </div>
+  );
+};
+
+const CullPhotoRow: React.FC<{ photo: PhotoInfo }> = ({ photo }) => {
+  const isKept = photo.keep === 1;
+  const isCulled = photo.keep === 0;
+  const isFailed = photo.status === "failed";
+  return (
+    <div className="flex items-center gap-1.5 text-[11px] py-0.5 group">
+      {isKept ? (
+        <CheckCircle2 size={11} className="text-phc-green shrink-0" />
+      ) : isCulled ? (
+        <XCircle size={11} className="text-red-500 shrink-0" />
+      ) : (
+        <XCircle size={11} className="text-amber-500 shrink-0" />
+      )}
+      <span className="truncate font-mono text-zinc-700" title={photo.source_path}>
+        {basename(photo.source_path)}
+      </span>
+      {isKept && photo.output_path && (
+        <span
+          className="text-phc-green font-mono shrink-0"
+          title={photo.output_path}
+        >
+          → {basename(photo.output_path)}
+        </span>
+      )}
+      {isCulled && (
+        <span className="text-zinc-400 text-[10px] shrink-0">已剔除</span>
+      )}
+      {isFailed && photo.error && (
+        <span className="text-red-500 text-[10px] shrink-0" title={photo.error}>
+          {photo.error.slice(0, 60)}
+        </span>
+      )}
     </div>
   );
 };

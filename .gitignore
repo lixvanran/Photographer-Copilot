@@ -49,3 +49,7 @@ htmlcov/
 
 # Test workspace
 .test_401/
+
+# Temp venv (sandbox local)
+/.tmpvenv/
+/backend/.venv/
