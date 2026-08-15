@@ -68,6 +68,8 @@ GRADE_PARAMS_SCHEMA_HINT = """
 
 ```json
 {
+  "no_op": false,                  // v0.2.3:如果你觉得"原图主基调就该这样,不该动",设为 true,所有其他参数归 0
+  "preserve": ["保留色块1", "保留色块2"],  // v0.2.3:1-3 个应该保留的色彩/光感/氛围,算法层会尊重
   "scene": "1 句话描述场景(必填,基于你看到的 + EXIF + 客观分析)",
   "diagnosis": "1-2 句话点出关键问题(必填,基于客观读数,不是套话)",
   "white_balance": {
@@ -143,11 +145,15 @@ def build_grade_prompt(
 ) -> str:
     """Build the user-prompt for one photo's color grading.
 
-    v0.2.1 升级:
-    - 删 style_preset 注入 — 套预设就是套滤镜
-    - 强调"看图说话":让 M3 看到 EXIF + 客观分析后**自己**判断
-      这张图属于什么场景、有什么问题、该动什么、保留什么。
-    - 用户提示词 scene_hint 保留 — 那是用户的具体意图(例:"逆光人像,保留背景冷蓝对比")
+    v0.2.3 升级(关键 — 解决"色彩怪异"问题):
+    - 删 prose + ```json``` 块的要求 —— 之前让 M3 既输出文字说明又输出 JSON,
+      配合 response_format=json_object 直接让 M3 输出 `{}`(2 token)放弃。
+      改成**只输出 JSON**,scene/diagnosis/notes 都放 JSON 字段里。
+    - 加 `no_op: bool` 字段 —— 允许 M3 判断"原图主基调就该这样,不动"
+      这是修"色彩怪异"的核心:很多照片(舞台/逆光/夜景)摄影师故意设计过,
+      M3 不该无脑"校正"。
+    - 加 `preserve` 字段 —— 让 M3 显式列出"应该保留的色彩/光感"
+    - 第一段就写"原图不一定是错的"——这是核心原则
 
     Args:
         scene_hint: 摄影师用自然语言写的意图(场景/保留/避开)
@@ -157,64 +163,83 @@ def build_grade_prompt(
     """
     sections: list[str] = []
 
-    sections.append("请分析这张照片并输出调色参数。")
+    sections.append("""你是摄影后期师。用户已经知道"自动滤镜"长什么样,他们要的是**针对这张图的判断**。
+
+## 核心原则(必须先看)
+
+**1. 原图不一定是"错的"**。摄影师在拍之前就设计过场景/光/色彩,可能是有意为之:
+- 舞台/演出:冷蓝 LED 背景 + 暖色舞台灯对比 → **保留**(这是设计感)
+- 逆光/夕阳:主体欠曝 + 暖光轮廓 → **保留**(轮廓和氛围是核心)
+- 夜景霓虹:低 luma + 高对比 + 偏色 → **保留**(这才是夜景)
+- 阴天/阴雨:低饱和 + 偏冷 → **大部分保留**(本来就这样)
+- 影棚闪光:中性还原 → 几乎不动
+- 街头抓拍/扫街:通常是 mid-tone,不动太多
+
+**2. 什么算"真问题"该动**:
+- 主体欠曝 0.7 档以上,脸部细节丢失 → 提 shadows
+- 高光 clip > 3%(人像脸部过曝) → 降 highlights
+- 严重偏色(整片严重黄/蓝)→ 校 WB(±15 区间)
+- 人像肤色明显偏色(整片黄绿/死红)→ 保护橙色调
+- 噪点/锐度问题 → 不在你的调色范围
+
+**3. 什么算"假问题"别动**:
+- "整体偏暗"但本来是夜景/逆光 → **别拉 exposure**
+- "整体偏冷"但本来是阴天/舞台 LED → **别动 WB**
+- "背景虚化乱"但本来是散景 → **别压暗**
+- "高光不过曝但有光感"→ **别压 highlights**
+
+**4. 不确定 → 输出 no_op**。M3 应该承认"我看着挺好,不该动"而不是非要给参数。
+""")
+
+    sections.append("""
+## 你的工作流(顺序)
+
+**step 1:看图说话** — 1 句话:`scene`(拍的是什么 + 光从哪来 + 主体是谁)。
+**step 2:客观诊断** — 1-2 句:`diagnosis`(基于下面给你的 EXIF + 直方图,只说有事实支持的问题)。
+**step 3:判断动还是不动**:
+- 如果你觉得"原图主基调是该被保留的,只是有 1-2 个真问题" → 给出针对性小参数
+- 如果你觉得"这张图整体就该这样" → `no_op: true`,其他参数全 0
+- 如果你觉得"这张图整体很糟,需要大动" → 给出大参数(±30 区间)
+**step 4:填 preserve 字段** — 列出 1-3 个"应该保留的色彩/光感/氛围",算法层会尊重。
+**step 5:notes 给用户** — 1-2 句"我做了什么 + 为什么,或我为什么不动"。
+
+""")
 
     if scene_hint:
         sections.append(
-            f"\n**摄影师意图(用自然语言,这是 AI 必须尊重的方向)**:{scene_hint}"
+            f"**摄影师意图(用户用自然语言写的,这是必须尊重的方向)**:\n{scene_hint}\n"
         )
 
     if exif_summary:
-        sections.append(f"\n**拍摄参数(EXIF,从文件读出来,事实)**:\n{exif_summary}")
+        sections.append(f"**拍摄参数(EXIF,事实)**:\n{exif_summary}\n")
 
     if image_stats:
         sections.append(
-            "\n**客观图像分析**(从图读出来,不是猜的 — 这是你判断的基础):\n"
-            + image_stats
+            f"**客观图像分析(从图读出来,这是你判断的事实基础,不是猜的)**:\n{image_stats}\n"
         )
 
     if user_feedback:
         sections.append(
-            f"\n**用户历史偏好**(从近期 👍/👎 推断):\n{user_feedback}"
+            f"**用户历史偏好(从近期 👍/👎 推断)**:\n{user_feedback}\n"
         )
 
     sections.append("""
-## 你的工作流(严格按这个顺序)
+## JSON 输出格式(严格遵守 — 你只输出一个 JSON 对象,不要 prose)
 
-**第一步:独立判断这张图**(不是套预设,不是套话)
-- `scene`: 1 句话 — 这张图拍的是什么、什么时段/天气/光、主体是谁。
-  EXIF + 客观分析是事实,你看到的是画面,这两者都要用上。
-- `diagnosis`: 1-2 句话点出**客观问题**(不是"氛围很好"这种空话)。
-  例:"平均亮度 89/255 偏暗,直方图右端贴边说明高光略过,肤色占比 18% 需要保护"
-
-**第二步:针对性给参数**(基于第一步的判断,不是模板)
-- 严格按下面的 schema 输出 JSON
-- **问题严重度 = 调色强度**:小问题用 ±5-15 区间;只有真严重才动 ±30 以上
-- **不动所有字段**:没问题的字段用 0;不调曲线就别写 `curve`
-- **保护人像肤色**:有肤色像素 > 5% 时,orange 的 hue/sat 都要保守
-- **保留戏剧性**:舞台/演出/逆光/夜景的光本身就是氛围,别压掉
-- **不要无脑"提亮"**:平均亮度 100 已经是中性,再提就过曝
-
-**第三步:解释你为什么这么做**
-- `notes` 字段给用户:做了什么 + 为什么(2-3 句,中文,**要说"我看到 X,所以动了 Y"**,不是"提升画面观感"这种套话)
-- 顺带一句"你下次拍摄可以注意什么"(教学风格)
+**关键:你只能输出 JSON。** 之前模型在 prose + JSON 混着输出,加上 response_format=json_object
+会让模型直接放弃(返回空对象)。所有文字说明(scene / diagnosis / notes)都要作为
+JSON 的字段值。
 
 """)
     sections.append(GRADE_PARAMS_SCHEMA_HINT)
 
     sections.append("""
-## 输出格式(严格遵守)
 
-```
-<scene 的一句话>
+**填法说明**:
+- `no_op`:默认 `false`。如果你觉得"原图主基调该保留,不该动",设为 `true`,**所有其他参数归 0**(算法层会跳过)。
+- `preserve`:数组,1-3 项,例如 `["冷蓝 LED 背景", "主体暖色皮肤", "背景散景光斑"]`。算法层会用这些 hint 来决定哪些色块不动。
+- 数值范围是**调整量**,不是目标值。问题严重度决定动多少,不是"非要用大值"。
 
-<diagnosis 的 1-2 句话>
-
-```json
-{...符合 schema 的 JSON...}
-```
-
-注意:`scene` / `diagnosis` / `notes` 这些文字说明 **也要写进 JSON 的对应字段**,不要只在 prose 里说。
 """)
     return "\n".join(sections)
 
@@ -249,6 +274,128 @@ def build_cull_prompt() -> str:
 
 注意:`scene` / `comment` 也要写进 JSON 对应字段,不要只在 prose 里说。
 """
+
+
+# v0.2.3 新增: AI 看图 — 纯分析 + 修图建议,不输出调色参数。
+# 这跟 grade 的区别:grade 直接给调色参数跑;analyze 只给文字评价和建议。
+ANALYZE_SCHEMA_HINT = """
+## 输出 JSON schema(严格遵守)
+
+```json
+{
+  "scene": "1 句话:这是什么样的照片(场景/主体/光线)",
+  "category": "人像|风景|街拍|演出|夜景|静物|建筑|其他",
+  "rating": {
+    "composition": 1..5,    // 构图
+    "lighting": 1..5,       // 光线
+    "color": 1..5,          // 色彩
+    "subject": 1..5,        // 主体(人物表情/动作或风景主体)
+    "technical": 1..5,      // 技术(对焦/曝光/噪点)
+    "overall": 1..5         // 综合
+  },
+  "rating_reason": "1-2 句话:为什么给这个综合分(不只是总分,是看你欣赏/不满意什么)",
+  "strengths": ["3-5 条做得好的点"],
+  "issues": [
+    {
+      "type": "exposure|color|composition|focus|white_balance|noise|other",
+      "severity": "minor|moderate|major",
+      "description": "具体描述(中文)",
+      "fixable": true|false
+    }
+  ],
+  "suggestions": [           // 修图建议(可执行)
+    {
+      "category": "白平衡|曝光|对比|HSL|曲线|裁切|锐化|降噪|拍摄|其他",
+      "action": "具体建议(中文,说'做什么 + 为什么 + 大概动多少')",
+      "priority": "high|medium|low"
+    }
+  ],
+  "composition_notes": "构图的 1-2 句总评(三分法/引导线/留白/比例...)+ 改进方向",
+  "lighting_notes": "光线的 1-2 句总评(方向/强度/色温/对比度)+ 改进方向",
+  "color_notes": "色彩的 1-2 句总评(主调/饱和/和谐/戏剧性)+ 改进方向",
+  "preserved": "你认为这张图最该被保留的核心是什么(1 句,中文 — 这句是修图时不能动的部分)",
+  "summary": "1 句总结(中文)"
+}
+```
+"""
+
+
+def build_analyze_prompt(
+    exif_summary: str | None = None,
+    image_stats: str | None = None,
+) -> str:
+    """Build the user-prompt for "AI 看图" — 纯分析 + 建议。
+
+    v0.2.3 新增。这是**跟 grade 不同的功能**:
+    - grade: 给调色参数,直接 apply 到图
+    - analyze: 给文字评价(构图/光线/色彩) + 修图建议,**不直接改图**
+
+    用户拿到 analyze 报告后,可以:
+    1. 自己手动修图(Lightroom / Photoshop)
+    2. 把 suggestions 喂给 grade 任务("一键应用"功能)
+    3. 看一眼了解问题,决定是不是要修
+    """
+    sections: list[str] = []
+
+    sections.append("""你是摄影教学教练 + 资深后期师。用户给你一张图,你要**全面客观地评价**,给出 5 维打分(构图/光线/色彩/主体/技术)、问题清单、修图建议。
+
+## 你的工作流
+
+**step 1:先看图** — 别急着打分,先把图看明白:
+- 这是什么场景?(人像/街拍/演出/夜景/...)
+- 光从哪来?(顺光/逆光/侧光/混合光/...)
+- 主体是谁?(单人人像/多人合影/风景主体/...)
+- 主色调是什么?(暖/冷/中性,以及冷暖对比)
+
+**step 2:打分(1-5 整数)**:
+- **5**:教科书级;**4**:有亮点;**3**:中规中矩;**2**:有明显问题;**1**:严重失误
+- 不要"基本都 4 分" — 真好给 5,真差给 2,3 是大多数
+- 综合分是 5 维的几何平均(取整),不是 1+1=2
+
+**step 3:列出 strengths(做得好的,3-5 条)** — 这很重要,用户知道自己哪做得好
+- 例:"逆光轮廓感很强""人物表情自然""构图三分法运用到位"
+
+**step 4:列出 issues(问题清单)** — 每条要有 type / severity / description / fixable
+- severity 判断标准:
+  - minor:小问题,可修可不修
+  - moderate:明显问题,建议修
+  - major:严重问题(糊片/过曝/构图严重失误),必修
+- fixable=true 表示修图能解决;false 表示是拍摄时的问题,修图救不了
+
+**step 5:suggestions(可执行修图建议)** — 每条要说"做什么 + 为什么 + 大概动多少"
+- 例:"曝光补偿 +0.3 EV 找回主体细节,目前主体欠 0.5 档"
+- 例:"降饱和 -15 拉回色彩,目前偏色温 8000K(冷)"
+- 例:"橙色 HSL 提亮 +10,提饱和 +5,让肤色回血"
+- 优先级 high=必做,medium=建议,low=锦上添花
+
+**step 6:三段"专项"评价** — composition_notes / lighting_notes / color_notes
+- 自由发挥,但每段 1-2 句总评 + 改进方向
+- 避免套话("整体不错,可以更好"),说具体("三分法应用很好,但右半部分留白过多,主体稍偏左")
+
+**step 7:preserved(最该保留的)** — 1 句话,这句是修图时**不能动**的部分
+- 例:"逆光在头发上的金色轮廓"
+- 例:"冷蓝 LED 背景的舞台氛围"
+- 例:"主客体之间的眼神交流"
+
+""")
+
+    if exif_summary:
+        sections.append(f"**拍摄参数(EXIF,事实)**:\n{exif_summary}\n")
+
+    if image_stats:
+        sections.append(
+            f"**客观图像分析(从图读出来,这是你判断的事实基础)**:\n{image_stats}\n"
+        )
+
+    sections.append("""
+## JSON 输出格式(只输出 JSON,不要 prose)
+
+**关键:你只能输出一个 JSON 对象。** 之前模型在 prose + JSON 混着输出,加
+response_format=json_object 会让模型直接放弃(返回空对象)。
+
+""")
+    sections.append(ANALYZE_SCHEMA_HINT)
+    return "\n".join(sections)
 
 
 # ---- 辅助:把 EXIF 字典拍平成 prompt 友好的字符串 ----

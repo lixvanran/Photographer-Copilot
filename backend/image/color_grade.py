@@ -92,8 +92,23 @@ def write_xmp_sidecar(jpeg_path: Path, params: dict[str, Any]) -> Path:
 def apply_color_grade(
     input_path: Path, output_path: Path, params: dict[str, Any]
 ) -> Path:
-    """Apply non-destructive color grading to an image."""
+    """Apply non-destructive color grading to an image.
+
+    v0.2.3 升级 — 修"色彩怪异"问题:
+    - 如果 M3 输出 `no_op: true`,直接拷贝原图,跳过所有算法。
+      这处理"原图主基调就该这样,不动"的情况。
+    - `preserve` 数组(1-3 项)目前只是 log 给用户,留给未来做"局部 mask"。
+      真"局部 mask"是个大工程(MVP 先不上),但保留这个字段让 M3
+      开始表达"应该保留什么"。
+    - XMP sidecar 还是写,这样 Lightroom 看到"我没动"也知道原参数。
+    """
     logger.info("Grading %s → %s", input_path.name, output_path.name)
+    if params.get("no_op"):
+        preserve = params.get("preserve", [])
+        logger.info(
+            "  no_op mode: M3 says 保留主基调不动. preserve=%s",
+            preserve,
+        )
     with Image.open(input_path) as im:
         im = ImageOps.exif_transpose(im)
         if im.mode != "RGB":
@@ -108,6 +123,10 @@ def apply_color_grade(
 
 def _apply_params(img: Image.Image, p: dict[str, Any]) -> Image.Image:
     """Apply all grading params in sequence. Returns a new image."""
+    # v0.2.3: no_op 直接返回原图
+    if p.get("no_op"):
+        return img.copy()
+
     out = img
 
     # 1. White balance — 在 HSL 色相空间做(更柔和,保留 luma)

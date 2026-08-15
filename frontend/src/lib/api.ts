@@ -98,6 +98,79 @@ export const getTask = (taskId: string) =>
   call<{ task: any; photos: PhotoInfo[]; photo_count: number }>("GET", `/tasks/${taskId}`);
 export const setPhotoFeedback = (photoId: number, feedback: "up" | "down") =>
   call<void>("POST", `/photos/${photoId}/feedback`, { feedback });
+
+// v0.2.3:AI 看图 — 上传单图,返回 5 维评价 + 问题清单 + 修图建议(JSON)
+export interface AnalyzeReport {
+  scene: string;
+  category: string;
+  rating: {
+    composition: number;
+    lighting: number;
+    color: number;
+    subject: number;
+    technical: number;
+    overall: number;
+  };
+  rating_reason: string;
+  strengths: string[];
+  issues: Array<{
+    type: string;
+    severity: "minor" | "moderate" | "major";
+    description: string;
+    fixable: boolean;
+  }>;
+  suggestions: Array<{
+    category: string;
+    action: string;
+    priority: "high" | "medium" | "low";
+  }>;
+  composition_notes: string;
+  lighting_notes: string;
+  color_notes: string;
+  preserved: string;
+  summary: string;
+}
+
+export interface AnalyzeResult {
+  analyze_id: string;
+  photo_path: string;
+  report: AnalyzeReport;
+}
+
+export const analyzePhoto = (file: File): Promise<AnalyzeResult> => {
+  // 用 XHR 而不是 fetch,因为 fetch 不能显示 progress,而且 multipart 用 FormData + POST 即可
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    const form = new FormData();
+    form.append("file", file);
+    xhr.open("POST", `${SIDECAR}/analyze/photo`);
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) {
+        // 进度上传到 console(用户看不到 — 这是一个轻量辅助,UI 可以以后加进度条)
+        // console.debug("analyze upload progress", e.loaded, "/", e.total);
+      }
+    };
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try {
+          resolve(JSON.parse(xhr.responseText));
+        } catch (e) {
+          reject(new Error("返回 JSON 解析失败"));
+        }
+      } else {
+        try {
+          const err = JSON.parse(xhr.responseText);
+          reject(new Error(err.detail || `HTTP ${xhr.status}`));
+        } catch {
+          reject(new Error(`HTTP ${xhr.status}: ${xhr.responseText.slice(0, 200)}`));
+        }
+      }
+    };
+    xhr.onerror = () => reject(new Error("网络错误"));
+    xhr.send(form);
+  });
+};
+
 // 历史:getRecentLogs / onBackendLog / subscribeLogs / LogEntry / emit /
 // emitBootLog 已经被移除。后端活动改在 cmd 里直接看 stdout(/workspace/.logs/sidecar.log)。
 

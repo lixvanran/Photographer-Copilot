@@ -52,6 +52,13 @@ from backend.agent.tools import (
     save_uploads,
     set_photo_feedback,
 )
+from backend.image.analysis import (
+    analyze_image,
+    format_exif,
+    format_image_stats,
+    parse_exif,
+)
+from backend.agent.prompts import build_analyze_prompt
 from backend.db.catalog import Catalog
 
 
@@ -487,6 +494,86 @@ async def chat(req: ChatRequest):
     )
 
 
+@app.post("/analyze/photo")
+async def analyze_photo(
+    file: UploadFile = File(..., description="要分析的照片"),
+):
+    """v0.2.3:AI 看图 — 上传单图,返回 5 维评价 + 问题清单 + 修图建议(JSON)。
+
+    跟 grade 的区别:grade 直接给调色参数并 apply 到图;
+    analyze 只给文字评价和建议,不修改原图。
+    """
+    if not file or not file.filename:
+        raise HTTPException(400, "no file provided")
+    # 限制大小:AI 看图不要太大,30MB 够
+    raw = await file.read()
+    if len(raw) > 30 * 1024 * 1024:
+        raise HTTPException(413, f"file too large ({len(raw)} bytes > 30MB)")
+    # 落到临时目录
+    suffix = Path(file.filename).suffix.lower() or ".jpg"
+    if suffix not in {".jpg", ".jpeg", ".png"}:
+        raise HTTPException(400, f"unsupported format: {suffix}")
+    analyze_id = str(uuid.uuid4())[:8]
+    analyze_dir = Path(__file__).resolve().parents[2] / "workspace" / ".analyze" / analyze_id
+    analyze_dir.mkdir(parents=True, exist_ok=True)
+    photo_path = analyze_dir / f"input{suffix}"
+    photo_path.write_bytes(raw)
+    # 缩成 preview(给 M3 看),省 token
+    preview_path = analyze_dir / "preview.jpg"
+    from backend.image.raw_processor import to_jpeg_preview
+    try:
+        await asyncio.to_thread(to_jpeg_preview, photo_path, preview_path)
+    except Exception as e:
+        logger.warning("analyze: to_jpeg_preview failed: %s", e)
+        # fallback:用原图
+        preview_path = photo_path
+    # 客观分析 + EXIF
+    exif_str = image_stats_str = None
+    try:
+        exif_dict = await asyncio.to_thread(parse_exif, photo_path)
+        exif_str = format_exif(exif_dict)
+        stats = await asyncio.to_thread(analyze_image, preview_path)
+        image_stats_str = format_image_stats(stats)
+    except Exception as e:
+        logger.debug("analyze: exif/stats failed: %s", e)
+    # 调 M3
+    prompt = build_analyze_prompt(
+        exif_summary=exif_str,
+        image_stats=image_stats_str,
+    )
+    try:
+        response = await state.m3.chat(
+            system="你是摄影教学教练 + 资深后期师,严格按 schema 输出 JSON。",
+            user_text=prompt,
+            images=[preview_path],
+            response_format="json",
+        )
+    except Exception as e:
+        raise HTTPException(500, f"M3 调用失败: {e}")
+    # parse JSON(剥 markdown fence)
+    text = response.strip()
+    if text.startswith("```"):
+        lines = text.split("\n")
+        if lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines)
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1:
+        raise HTTPException(500, f"M3 returned invalid JSON: {text[:200]}")
+    try:
+        report = json.loads(text[start : end + 1])
+    except json.JSONDecodeError as e:
+        raise HTTPException(500, f"JSON parse failed: {e}")
+    return {
+        "analyze_id": analyze_id,
+        "photo_path": str(photo_path),
+        "report": report,
+    }
+
+
 @app.get("/events/{task_id}")
 async def task_events(task_id: str):
     """SSE stream for task events.
@@ -547,4 +634,7 @@ if __name__ == "__main__":
     port = int(port_env) if port_env else pick_free_port()
     write_port_file(port)
     logger.info("Starting sidecar on 127.0.0.1:%d", port)
-    uvicorn.run(app, host="127.0.0.1", port=port, log_level=LOG_LEVEL.lower())
+    # v0.2.3: 显式 loop="asyncio" — uvloop 0.17+ API 变更过
+    # (.new_event_loop 没了),asyncio loop 一直稳,不会因为
+    # sandbox 残留坏 uvloop 报 "module 'uvloop' has no attribute 'new_event_loop'"
+    uvicorn.run(app, host="127.0.0.1", port=port, log_level=LOG_LEVEL.lower(), loop="asyncio")

@@ -2,19 +2,19 @@
 
 一个跑在用户本地的「摄影工作区 Agent」,用 MiniMax M3 多模态帮摄影师做**一键调色 / 一键筛片 / 回答摄影问题**。数据不离开电脑。
 
-![Version](https://img.shields.io/badge/version-v0.2.2-blue.svg)
+![Version](https://img.shields.io/badge/version-v0.2.3-blue.svg)
 ![Status](https://img.shields.io/badge/status-stable-green.svg)
 ![License](https://img.shields.io/badge/license-MIT-purple.svg)
 
-## v0.2.2 升级要点
+## v0.2.3 升级要点
 
-这一版核心做了三件事:**修了一个真在影响效率的 bug** + **会话改成多对话模式** + **重点优化 AI 调色效果**。
+这一版核心做了三件事:**修 cull bug** + **多会话模式** + **AI 调色优化** + **新加"AI 看图"功能**。
 
-> 相比 v0.2.1:把上一版加的"风格 preset"按钮全砍了(套预设就是套市面滤镜),改成让 AI 真正读懂每张图自己决定调色方向。
+> 相比 v0.2.2:解决"修图色彩怪异"问题(M3 之前会让原图氛围丢失),并新增"AI 看图"功能 — 上传单图,Agent 给出 5 维评价 + 问题清单 + 修图建议。
 
 ### 1. 修 cull bug — 一键筛片"文件传不了" / "传了没反应"
 
-之前 cull 完 frontend 拿到任务详情时,`photos[].output_path` 全是 `null`,只能看 keep/quality 状态,看不到产出文件在哪。根因是 `upsert_photo` 调 `output_path=...` 时 dest 还没赋值(`UnboundLocalError`)。v0.2.2 改完:
+之前 cull 完 frontend 拿到任务详情时,`photos[].output_path` 全是 `null`,只能看 keep/quality 状态,看不到产出文件在哪。根因是 `upsert_photo` 调 `output_path=...` 时 dest 还没赋值(`UnboundLocalError`)。v0.2.3 改完:
 
 - 复制 → catalog 顺序对调,`output_path` 真的写进 SQLite
 - `TaskProgress.tsx` 加 cull 照片列表 + ✅/❌/failed 状态 + 每张照片的 `output_path` 链接(可预览/打开)
@@ -23,7 +23,7 @@
 
 ### 2. 多会话模式 — 独立上下文的对话列表
 
-之前只有一个 messages 列表,新建任务要 `Ctrl+A → Del`。v0.2.2 改成左侧栏对话列表:
+之前只有一个 messages 列表,新建任务要 `Ctrl+A → Del`。v0.2.3 改成左侧栏对话列表:
 
 - **每个对话的 messages 完全独立**(`Conversation` interface + `activeConvId` 切换),互不串
 - 新建 / 删除 / 切换 / 清空当前对话
@@ -34,25 +34,43 @@
 
 ### 3. 重点:AI 调色优化(这版最重要的改进)
 
-之前调色效果不理想的根因 — M3 **没拿到足够上下文**就开始下参数,所以经常瞎给:明明偏色了却给"自然还原",照片欠曝却不动 exposure,HSL 一拉就给橙色 +30 把肤色搞怪。v0.2.2 从三方面系统修:**核心是"AI 自己看图说话",不是套预设滤镜**。
+之前调色效果不理想的根因 — M3 **没拿到足够上下文**就开始下参数,所以经常瞎给:明明偏色了却给"自然还原",照片欠曝却不动 exposure,HSL 一拉就给橙色 +30 把肤色搞怪。v0.2.3 从三方面系统修:**核心是"AI 自己看图说话",不是套预设滤镜**。
 
-> **重要设计变更**:之前一版试过加 7 种"风格 preset"按钮(自然/明亮/电影/暖色/冷色/胶片/黑白),但这其实就是把市面滤镜换个名字让 AI 套——AI 该做的是**读懂这张图**,不是给一张"看起来差不多"的滤镜。v0.2.2 砍掉所有 preset 按钮,只留一个"用自然语言告诉 AI 你想做什么"的输入框,所有调色方向由 AI 基于客观分析自己决定。
+> **重要设计变更**:之前一版试过加 7 种"风格 preset"按钮(自然/明亮/电影/暖色/冷色/胶片/黑白),但这其实就是把市面滤镜换个名字让 AI 套——AI 该做的是**读懂这张图**,不是给一张"看起来差不多"的滤镜。v0.2.3 砍掉所有 preset 按钮,只留一个"用自然语言告诉 AI 你想做什么"的输入框,所有调色方向由 AI 基于客观分析自己决定。
 
-#### a) Prompt 改造:"每张图独立判断"哲学
+#### a) v0.2.3 修"色彩怪异"问题(本版核心改进)
+
+**之前 v0.2.2 的 bug**:M3 看到"整体偏冷"就给"加暖 +5~8",把舞台 LED 冷蓝 / 逆光暖橙 / 夜景霓虹的氛围都"中和"了 — 修完图反而失去原图设计感。
+
+**根因**:
+1. prompt 没说"原图不一定是错的",M3 默认所有偏色都是"待修问题"
+2. M3 输出 JSON 时配合 `response_format=json_object` 会和 prompt 里"先 prose 再 ```json```"的要求冲突,直接返回 `{}`(2 token)放弃
+
+**修法**:
+- **"原图不一定是错的"写进 prompt 最前面**,并明确教 M3 哪些场景该保留(舞台/逆光/夜景/阴天/影棚/街拍),哪些是真问题(欠曝 0.7 档以上 / 高光 clip > 3% / 严重偏色)
+- **加 `no_op: bool` 字段** — M3 判断"原图主基调就该这样"就 `no_op=true`,其他参数全 0,`color_grade.py` 短路直接返回原图拷贝
+- **加 `preserve: ["..."]` 字段** — M3 显式列出"该保留的色彩/光感/氛围"(算法层会尊重)
+- **删 prose 要求**,改成"只输出 JSON",文字说明都进 JSON 字段(避免 json_object 冲突)
+
+**真 M3 跑出来的效果**:
+- **逆光弹琴图**:M3 正确判断"主基调必须保留,暖就是灵魂",WB **不动 0**,只 shadows +20 救主体,vib +5 提血色。结果:逆光氛围完整保留,主体从"过暗"变成"可读"
+- **舞台舞者图**:M3 正确判断"冷青 LED 是氛围核心",WB 只动 +8(不是 +30),主调放在 shadows +35 救脸部。结果:冷蓝 LED 还在,主体面部提亮,没"拉暖杀掉整个氛围"
+
+#### b) Prompt 改造:"每张图独立判断"哲学
 - 强制 M3 看到 EXIF + 客观分析后,**自己**判断这张图属于什么场景、有什么问题、保留什么
 - `scene` / `diagnosis` / `notes` 都要写真实观察(不是套话),notes 必须说"我看到 X,所以动了 Y"
 - 禁止套固定套路:不是所有夜景都该冷调,不是所有"看着闷"都该 +contrast,不是所有"逆光"都该提亮
 - 参数范围给"sweet spot 提示"(人像保守 / 风景大胆 / 演出/夜景针对当前光),但**是参考不是模板**
 
-#### b) EXIF + 客观图像分析(新模块 `image/analysis.py`)
+#### c) EXIF + 客观图像分析(新模块 `image/analysis.py`)
 - 每张调色前同步读 EXIF(品牌/型号/ISO/光圈/快门/原 WB/拍摄时间),写进 prompt
 - 客观分析:平均亮度 / 直方图 8 段分布 / 平均饱和度 / 阴影/高光 clip 比例 / 估计色温(K) / **肤色像素占比**
 - M3 看到"肤色占比 18%"就知道保护肤色;看到"色温 ~7500K + 偏冷光"就知道这是阴天/夜景,可能保留戏剧性而不是压
 
-#### c) 用户反馈 → 风格倾向学习
+#### d) 用户反馈 → 风格倾向学习
 点 `👍` / `👎` 会被 catalog 记录(`photos.feedback`),下次调色前取最近 10 条,告诉 M3 "用户喜欢什么 / 不喜欢什么"。例:"👍 的最近 3 张:contrast=20, temp=+15, sat=10" → M3 后续输出会更靠近这个调子。
 
-#### d) color_grade.py 算法优化
+#### e) color_grade.py 算法优化
 - HSL mask 改 **cosine falloff**(原来硬阈值,现在 ±0.11 hue 距离内 cos 曲线渐变),无 banding
 - HSL 强度按 saturation 衰减 — 灰区(低 s)不会被乱加色,避免 noise
 - 对比度改 **5 控制点 + 5-tap Gaussian 平滑 LUT**(原来线性 S-curve 有硬拐点)
@@ -61,12 +79,44 @@
 - **新加 split toning** — highlights / shadows 独立加色,XMP sidecar 写全 Lightroom 字段
 - 调参范围收窄(wb ±15 而不是 ±100,sat ±10 而不是 ±30),让 mock/弱模型也不会"一拉到底"
 
-#### e) XMP sidecar 升级
-之前只写基本 11 个字段,Lightroom 导入丢 split tone / 部分 HSL。v0.2.2 加上 `crs:SplitToningHighlightHue/Saturation` + `crs:SplitToningShadowHue/Saturation`,Lightroom 直接看到。
+#### f) XMP sidecar 升级
+之前只写基本 11 个字段,Lightroom 导入丢 split tone / 部分 HSL。v0.2.3 加上 `crs:SplitToningHighlightHue/Saturation` + `crs:SplitToningShadowHue/Saturation`,Lightroom 直接看到。
+
+### 4. 新增"AI 看图"功能
+
+> v0.2.3 修完"色彩怪异"问题后,顺带加了**独立功能** — 用户上传单图,Agent 全面评价,给修图建议。
+
+**功能定位**:
+- **一键修图**(grade):上传一批图 → M3 给每张调色参数 → 系统 apply → 输出 JPEG/XMP。**直接改图**。
+- **AI 看图**(analyze):上传单图 → M3 给 5 维评价 + 问题清单 + 修图建议(JSON)。**不直接改图**,用户拿到报告自己看(可以自己手动精修,或者拿建议喂回 grade 任务)。
+
+**怎么用**:
+- 左侧栏点 "AI 看图" tab(眼睛图标)
+- 拖拽 / 点选上传 JPG / PNG(最大 30MB)
+- 等 5-15 秒,M3 返回报告
+
+**报告长啥样**:
+- **头部**: `category`(人像/街拍/演出/夜景/...) + 综合分(1-5 星)
+- **5 维评分**: 构图 / 光线 / 色彩 / 主体 / 技术 各 1-5 星
+- **👍 做得好的** (`strengths`): 3-5 条具体点
+- **⚠️ 问题清单** (`issues`): 每条带 `type` / `severity` (minor/moderate/major) / `description` / `fixable`(修图能救 vs 拍摄问题)
+- **🛠️ 修图建议** (`suggestions`): 每条带 `category` / `action` / `priority` (high/medium/low)
+- **专项总评**: `composition_notes` / `lighting_notes` / `color_notes` 三个段
+- **🔒 最该保留的** (`preserved`): 1 句话 — 这张图**最不能动的部分**,后期所有调整都围绕这个
+- **总结** (`summary`): 1 句
+
+**真 M3 跑出来的效果**(逆光弹琴图,5 维评分):
+- 构图 3 / 光线 4 / 色彩 4 / 主体 3 / 技术 3,综合 3
+- 5 条 strengths(具体到"发丝上的金色轮廓光非常漂亮,是整张图最出彩的细节")
+- 6 条 issues(1 major: 谱架挡脸 / 1 moderate: 脸欠曝 0.5-1 档 / 4 minor: 上方留白多、右侧观众头、锐度偏软、电缆乱)
+- 8 条 suggestions(3 high: 阴影 +40-60 + 橙色 HSL + 径向蒙版提亮 / 2 medium: 裁切 + 锐化 / 3 low: 修脏 + WB + 拍摄建议)
+- preserved: "发丝上的金色逆光轮廓和户外黄昏的温暖氛围 — 这是这张图最不能动的灵魂"
+
+**API**: `POST /analyze/photo` 接收 multipart `file` 字段,返回 `{analyze_id, photo_path, report}`。
 
 ---
 
-## v0.2.0 升级要点(上一版,作 v0.2.2 changelog 参照)
+## v0.2.0 升级要点(上一版,作 v0.2.3 changelog 参照)
 
 这一版核心解决两个真在用的痛点 + 顺手清理了若干历史包袱。
 
@@ -130,7 +180,7 @@ python3 diagnose.py    # 诊断,生成 diagnose.txt
 └──────────────────────────────────────────────────────┘
 ```
 
-v0.2.2+ 计划接入 Tauri 2 (Rust) 桌面壳,代码在 `src-tauri/` 已就位(v0.2.0 暂不启用,需要 MSVC Build Tools)。
+v0.2.3+ 计划接入 Tauri 2 (Rust) 桌面壳,代码在 `src-tauri/` 已就位(v0.2.0 暂不启用,需要 MSVC Build Tools)。
 
 ## 已实现
 
@@ -179,7 +229,7 @@ photographer-copilot/
 │   │   └── styles/      (Apple 毛玻璃基础类)
 │   └── vite.config.ts + tailwind.config.js
 │
-├── src-tauri/                         # Tauri 桌面壳 (v0.2.2+ 启用,需要 MSVC Build Tools)
+├── src-tauri/                         # Tauri 桌面壳 (v0.2.3+ 启用,需要 MSVC Build Tools)
 │   ├── src/  (5 个 Rust 文件)
 │   ├── capabilities/ + icons/
 │   └── tauri.conf.json + Cargo.toml
@@ -187,7 +237,7 @@ photographer-copilot/
 ├── docs/ARCHITECTURE.md               # 架构文档
 ├── examples/sample_jpegs/             # 8 张场景示例图
 ├── scripts/smoke_test.py
-├── knowledge_base/                    # M3 提示词预设(v0.2.2+ 充实)
+├── knowledge_base/                    # M3 提示词预设(v0.2.3+ 充实)
 └── samples/                           # 演示数据
 ```
 

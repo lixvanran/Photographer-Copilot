@@ -9,11 +9,12 @@ import {
   Plus,
   Trash2,
   MessagesSquare,
+  Eye,
 } from "lucide-react";
 import { getConfig, onSystemMessage, sidecarHealth, type ConfigInfo } from "../lib/api";
 import type { Conversation } from "../lib/api-types";
 
-export type ViewKey = "chat" | "grade" | "cull";
+export type ViewKey = "chat" | "grade" | "cull" | "analyze";
 
 interface Props {
   view: ViewKey;
@@ -200,6 +201,13 @@ export const Sidebar: React.FC<Props> = ({
           >
             <Scissors size={16} className={view === "cull" ? "" : "text-phc-accent"} />
             <span>一键筛片</span>
+          </button>
+          <button
+            className={`nav-item ${view === "analyze" ? "nav-item-active" : ""}`}
+            onClick={() => onChangeView("analyze")}
+          >
+            <Eye size={16} className={view === "analyze" ? "" : "text-phc-accent"} />
+            <span>AI 看图</span>
           </button>
         </nav>
       </div>

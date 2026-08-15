@@ -4,6 +4,7 @@ import { Sidebar, type ViewKey } from "./components/Sidebar";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { GradeView } from "./views/GradeView";
 import { CullView } from "./views/CullView";
+import { AnalyzeView } from "./views/AnalyzeView";
 import type { SelectedTarget } from "./components/WorkspacePanel";
 import type {
   ChatMessage,
@@ -531,6 +532,8 @@ const App: React.FC = () => {
             refreshKey={refreshKey}
           />
         );
+      case "analyze":
+        return <AnalyzeView onMessage={showToast} />;
       case "chat":
       default:
         return (
